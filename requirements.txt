@@ -1,0 +1,23 @@
+# CHかんばんセット — 依存パッケージ
+# Python 3.11 系で実行してください（3.11.14 で動作確認）
+#
+# インストール方法:
+#   pip install -r requirements.txt
+#
+# または Conda をお勧めします:
+#   conda create -n DIG_new python=3.11
+#   conda activate DIG_new
+#   pip install -r requirements.txt
+
+# データ処理
+pandas==2.3.3
+numpy==2.3.4
+
+# Excel 出力
+openpyxl==3.1.5
+
+# GUI フレームワーク（CustomTkinter）
+customtkinter==5.2.2
+
+# テスト（開発時のみ必要。environment.yml 経由の場合は conda が導入する）
+pytest==9.0.3

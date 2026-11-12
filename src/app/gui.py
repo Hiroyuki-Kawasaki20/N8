@@ -1,0 +1,2593 @@
+# -*- coding: utf-8 -*-
+"""
+CHかんばんセット — メインGUIアプリケーション
+
+引取作業者が1人のため:
+- メイン工程: 1人で入車時間順に処理可能な山
+- リリーフ工程: メインで間に合わない山
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import customtkinter as ctk
+from pathlib import Path
+from datetime import datetime, timedelta
+import os
+import sys
+import json
+import logging
+
+import pandas as pd
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# パス設定（srcの親ディレクトリをsys.pathに追加）
+_SRC_DIR = Path(__file__).resolve().parents[1]
+if str(_SRC_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR.parent))
+
+from src.models.constants import (
+    DEFAULT_HEIGHT_CAP, DEFAULT_MIXING_KEY,
+    BASE_ONE_TIME, MIDDLE_WORK, BASE_PER_PAL,
+    PROC_MAIN, PROC_RELIEF, PROC_OVERFLOW, PROC_MAIN_LABEL, PROC_RELIEF_LABEL, PROC_OVERFLOW_LABEL,
+    COLOR_MAIN, COLOR_RELIEF, COLOR_OVERFLOW, COLOR_VIOLATION,
+    VIRTUAL_YAMA_NO, is_virtual_yama, SPLIT_UKEIRE_ROUTES, LOCAL_OUTPUT_DIR,
+    SPECIAL_HINBAN,
+)
+from src.services.data_loader import (
+    load_data, DataManager,
+    get_master_path, load_pickup_time_master_xlsx, save_pickup_time_master_xlsx,
+    MasterFileLockedError, MasterFileReadError, build_master_not_found_message,
+    _resolve_shipments_path,
+    parse_ukeire_ch_excel, load_config, save_config, get_export_dir,
+    set_flag_value_to_checkbox_mark, checkbox_mark_to_set_flag_value,
+)
+from src.services.sorter import (
+    run_pipeline, build_all_mountain_details, create_battery_change_mountain,
+    compute_basic_groups, compute_mixed_groups, compute_dest_by_mountain,
+    get_dest_list_for_group,
+)
+from src.services.process_assigner import (
+    compute_proc_details, assign_processes_by_arrival_time,
+    compute_proc_summary,
+    _time_to_seconds, _seconds_to_hhmm, _to_operational_timeline_secs,
+    _calc_work_end_with_breaks, ARRIVAL_BUFFER_SECS,
+    PICKUP_DEADLINE_BUFFER_SECS,   # ← 締切(入車10分前)。ARRIVAL_BUFFER_SECS(同じ10分)は前便入車+10分の「床」用で別物
+ )
+from src.services.scheduler import (
+    cluster_by_store,
+    _mountain_context,
+    insert_virtual_mountain_into_lane,
+    aggregate_proc_details_to_mountains,
+)
+from src.services.exporter import (
+    _to_display_hhmm_24h,
+    build_spo_export_df, export_spo_xlsx_staged,
+    attach_pickup_start_time, attach_entry_time_to_groupeddata, export_kanban_xlsx,
+    append_to_spo_history,
+    sort_pallets_for_numbering,
+)
+from src.services.lane_end_times_history import (
+    push_lane_end_times, select_lane_end_times,
+    generate_lane_end_times_label, normalize_choice_label,
+    save_lane_end_times_history, load_lane_end_times_history,
+)
+from src.services.export_validator import verify_export_invariant
+from src.services.export_archive import archive_export, resolve_archive_dir
+from src.utils.normalizer import _normalize_dest_name, _ZEN2HAN_DIGIT_COLON
+
+APP_VERSION = "2026-11-04 起動時stderr警告処理とbat運用案内を修正"
+# ===== CustomTkinter 設定 =====
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
+
+def resolve_spo_output_dirs(spo_watch_dir: str) -> dict:
+    """3ファイルの出力先を返す（テスト可能な純粋関数）。
+    
+    Power Automateの多重トリガー防止のため、SPO監視フォルダに落ちるファイルを
+    SPOアップロード用.xlsx のみとし、履歴とCSVはローカル固定フォルダに分離する。
+    
+    Args:
+        spo_watch_dir: SPO監視フォルダ（OneDrive共有フォルダ）のパス
+    
+    Returns:
+        dict: 3つの出力先を含む辞書
+            - spo_xlsx_dir: SPOアップロード用.xlsx の出力先（SPO監視フォルダ）
+            - history_dir: SPOアップロード用_履歴.xlsx の出力先（ローカル固定フォルダ）
+            - unmatched_dir: SPOアップロード用_未ヒット一覧.csv の出力先（ローカル固定フォルダ）
+    """
+    return {
+        "spo_xlsx_dir": spo_watch_dir,
+        "history_dir": LOCAL_OUTPUT_DIR,
+        "unmatched_dir": LOCAL_OUTPUT_DIR,
+    }
+
+
+
+# ============================================================
+# Issue #45: セットボードの並び順キー（深夜跨ぎ対応 / テスト可能な純関数）
+# exporter.py の _start_key と同一思想。判定境界は 03:00（Issue #43準拠）。
+# ============================================================
+def _start_sort_key_for_test(start_times: dict, yama_no) -> tuple:
+    from src.utils.normalizer import _normalize_hhmm
+
+    st = str(start_times.get(int(yama_no), "")).strip()
+    try:
+        norm = _normalize_hhmm(st)
+    except Exception:
+        norm = ""
+    if not norm:
+        return (1, 10 ** 9, int(yama_no))
+    try:
+        hh, mm = str(norm).split(":", 1)
+        mins = int(hh) * 60 + int(mm)
+        # Issue #43: 深夜跨ぎ便(00:xx)が先頭に飛ぶ不具合を修正。
+        # 判定境界03:00はexporter.py _start_key(Issue #43)と同一。
+        if mins < 3 * 60:
+            mins += 24 * 60
+        return (0, mins, int(yama_no))
+    except Exception:
+        return (1, 10 ** 9, int(yama_no))
+
+
+
+def _special_hinban_first(df: pd.DataFrame) -> pd.DataFrame:
+    """セットボードの山詳細だけ、特例品番の行を先頭（└1、2枚なら └1・└2）に出す。
+
+    作業者が特例品番を山の最上段に置く運用に、GUI の表示を合わせる。表示専用で、
+    GroupedData の「番号」は変えない。特例どうし、それ以外どうしの並びは、
+    渡された df の並び（exporter.sort_pallets_for_numbering の結果）を保つ。
+    HINBAN 列が無い、または特例品番が無いときは、そのまま返す。
+    """
+    if df is None or df.empty or "HINBAN" not in df.columns:
+        return df
+    hinban = df["HINBAN"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    is_special = hinban.eq(SPECIAL_HINBAN)
+    if not is_special.any():
+        return df
+    return pd.concat([df[is_special], df[~is_special]])
+
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("CHかんばんセット — 仕分け・セットボード")
+        self._version_label = APP_VERSION
+        _sw = self.winfo_screenwidth()
+        _sh = self.winfo_screenheight()
+        _w = min(1600, max(1200, _sw - 40))
+        _h = min(980, max(760, _sh - 80))
+        self.geometry(f"{_w}x{_h}")
+        self.minsize(1200, 760)
+
+        # データ読み込み
+        df_shipments, df_places = load_data()
+        self.data_mgr = DataManager(df_shipments, df_places)
+
+        # フィールド初期化
+        self.height_cap = tk.IntVar(value=DEFAULT_HEIGHT_CAP)
+        self.mixing_key = tk.StringVar(value=DEFAULT_MIXING_KEY)
+        self.selections = []
+        self.filtered = pd.DataFrame()
+        self.expanded = pd.DataFrame()
+        self.group_results = {}
+        self.group_details = {}
+        self.size1_mixed_summary = None
+        self.size1_mixed_details = None
+        self.proc_details = pd.DataFrame()
+        self.proc_details_display = pd.DataFrame()
+        self.proc_summary = pd.DataFrame()
+        self.mountain_proc = pd.DataFrame()
+        self.mountain_proc_map = {}
+        self.mountain_start_times = {}
+        self.all_mountain_details = pd.DataFrame()
+        self.all_mountain_details_display = pd.DataFrame()
+        self.auto_export_csv = True
+        self.auto_reload_shipments = True
+        self.auto_reload_minute = tk.IntVar(value=15)
+        self.auto_reload_minute_str = tk.StringVar(value="15")
+        # ===== バッテリー交換フラグ（デフォルトOFF） =====
+        self.enable_battery_change = tk.BooleanVar(value=False)
+        self._receipt_section_expanded = False
+        self._last_auto_reload_success_at = ""
+        self._auto_reload_after_id = None
+        self.export_dir = str(get_export_dir())
+        self.master_data = pd.DataFrame(columns=["OData_納入先", "NONYUHIBIN", "入車時間", "セットありフラグ"])
+        # ===== 前回終了時刻の履歴管理 =====
+        # 最大2件・最新が先頭。GUI落ち対策でファイルから復元する
+        self.lane_end_times_history = load_lane_end_times_history()
+        self._last_lane_end_times = {}  # 直前の計算結果を一時保存（push時に使用）
+        self.selected_history_choice = tk.StringVar(value="最新")
+        self.late_relief_warnings = []
+        self._route_display_to_internal = {}  # "KVC-B7" -> "KVC" のマッピング
+        self._load_auto_reload_settings()
+
+        # UI構築
+        self.build_ui()
+        self.reapply_treeview_tags()
+        self.refresh_routes()
+        self.bind("<Return>", lambda e: self.run())
+        self.bind("<KP_Enter>", lambda e: self.run())
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 入車時間マスタを遅延読込
+        self.after(200, self._initial_load_master)
+        if self.auto_reload_shipments:
+            self._schedule_auto_reload()
+
+    def _load_auto_reload_settings(self):
+        """自動再読込の分設定を設定ファイルから読み込む。"""
+        try:
+            config = load_config()
+            minute = int(config.get("auto_reload_minute", 15))
+            if minute < 0 or minute > 59:
+                minute = 15
+        except Exception:
+            minute = 15
+        self.auto_reload_minute.set(minute)
+        self.auto_reload_minute_str.set(f"{minute:02d}")
+        self.archive_enabled = bool(config.get("archive_enabled", True))
+        self.archive_dir = str(config.get("archive_dir", ""))
+        self.export_invariant_strict = bool(config.get("export_invariant_strict", True))
+        self.export_invariant_audit_cost = bool(config.get("export_invariant_audit_cost", False))
+        # バッテリー交換チェックは「毎回OFF開始」仕様のため、
+        # 設定ファイルからは復元しない。
+
+    def _save_auto_reload_settings(self):
+        """自動再読込の分設定を設定ファイルへ保存する。"""
+        try:
+            config = load_config()
+            config["auto_reload_minute"] = int(self.auto_reload_minute.get())
+            # バッテリー交換チェックは一時操作のため永続化しない。
+            save_config(config)
+        except Exception as error:
+            logger.error("設定の保存に失敗しました", exc_info=True)
+            messagebox.showwarning("設定保存エラー", f"設定を保存できませんでした。\n{error}")
+
+    def _on_close(self):
+        """終了時に予約済みタイマーを解放して安全に閉じる。"""
+        try:
+            if self._auto_reload_after_id is not None:
+                self.after_cancel(self._auto_reload_after_id)
+                self._auto_reload_after_id = None
+        except Exception:
+            pass
+        self.destroy()
+
+    def _schedule_auto_reload(self):
+        """設定された分の次時刻にCSV再読込を実行するタイマーを予約。"""
+        now = datetime.now()
+        reload_minute = int(self.auto_reload_minute.get())
+        next_run = now.replace(minute=reload_minute, second=0, microsecond=0)
+        if now >= next_run:
+            next_run = next_run + timedelta(hours=1)
+        delay_ms = max(1000, int((next_run - now).total_seconds() * 1000))
+        self._auto_reload_after_id = self.after(delay_ms, self._run_scheduled_reload)
+
+    def _run_scheduled_reload(self):
+        """予約時刻にCSVを自動再読込し、次回予約を設定。"""
+        self._auto_reload_after_id = None
+        try:
+            self.reload_shipments_data(show_message=False)
+        finally:
+            if self.auto_reload_shipments:
+                self._schedule_auto_reload()
+
+    def _on_auto_reload_minute_changed(self, minute_text: str):
+        """自動再読込分が変更されたら保存し、次回予約を更新する。"""
+        try:
+            minute = int(str(minute_text).strip())
+            if minute < 0 or minute > 59:
+                raise ValueError("minute out of range")
+        except Exception:
+            minute = 15
+        self.auto_reload_minute.set(minute)
+        self.auto_reload_minute_str.set(f"{minute:02d}")
+        self._save_auto_reload_settings()
+        try:
+            if self._auto_reload_after_id is not None:
+                self.after_cancel(self._auto_reload_after_id)
+                self._auto_reload_after_id = None
+        except Exception:
+            pass
+        if self.auto_reload_shipments:
+            self._schedule_auto_reload()
+
+    def reapply_treeview_tags(self):
+        try:
+            self.kb_summary.tag_configure("proc_main", background="#DBEAFE", foreground="#1E3A5F")
+            self.kb_summary.tag_configure("proc_relief", background="#FCE7F3", foreground="#831843")
+        except Exception:
+            pass
+
+    def _update_status(self):
+        try:
+            now_str = datetime.now().strftime("%H:%M")
+            mountain_num = len(self.mountain_proc) if self.mountain_proc is not None and not self.mountain_proc.empty else 0
+
+            # パレット総数（セットボードの表示件数。バッテリー交換の仮想山は除く）
+            pallet_num = 0
+            df = self.proc_details_display
+            if df is not None and not df.empty and "山通番" in df.columns:
+                pallet_num = int((~df["山通番"].map(is_virtual_yama)).sum())
+
+            p_main = sum(1 for v in self.mountain_proc_map.values() if str(v) == PROC_MAIN)
+            p_relief = sum(1 for v in self.mountain_proc_map.values() if str(v) == PROC_RELIEF)
+            auto_reload_part = f" | 自動再読込: {self._last_auto_reload_success_at}" if self._last_auto_reload_success_at else ""
+            self.status_bar.configure(
+                text=f"前回実行: {now_str} | 山数: {mountain_num} | パレット: {pallet_num}枚 | メイン: {p_main}山  リリーフ: {p_relief}山{auto_reload_part} | {self._version_label}"
+            )
+        except Exception:
+            pass
+
+    def build_ui(self):
+        C_BG = "#F5F7FA"
+        C_SIDEBAR = "#FFFFFF"
+        C_ACCENT = "#4361EE"
+        C_ACCENT_HOVER = "#3A56D4"
+        C_SUCCESS = "#2EC4B6"
+        C_SUCCESS_HOVER = "#25A89C"
+        C_DANGER = "#E63946"
+        C_DANGER_HOVER = "#CF2F3C"
+        C_WARN = "#F4A261"
+        C_WARN_HOVER = "#E08C4A"
+        C_NEUTRAL = "#8D99AE"
+        C_NEUTRAL_HOVER = "#7A8598"
+        C_INFO = "#457B9D"
+        C_INFO_HOVER = "#3A6B8A"
+        C_STATUS = "#2B2D42"
+        C_STEP1 = "#4361EE"
+        C_STEP2 = "#457B9D"
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview", font=("Meiryo UI", 10), rowheight=28,
+                        background="white", fieldbackground="white", foreground="#2B2D42")
+        style.configure("Treeview.Heading", font=("Meiryo UI", 10, "bold"),
+                        background="#E8EDF2", foreground="#2B2D42", relief="flat")
+        style.map("Treeview.Heading", background=[("active", "#D6DCE5")])
+        style.map("Treeview", background=[("selected", "#D0E2F4")], foreground=[("selected", "#1A1A2E")])
+
+        # セットボード専用スタイル（視認性重視）
+        style.configure("SetboardLane.Treeview", font=("Meiryo UI", 14), rowheight=48,
+                background="#FFFFFF", fieldbackground="#FFFFFF", foreground="#1F2A44")
+        style.configure("SetboardLane.Treeview.Heading", font=("Meiryo UI", 13, "bold"),
+                background="#D8DEE6", foreground="#10203A", relief="flat")
+        style.configure("SetboardDetail.Treeview", font=("Meiryo UI", 13), rowheight=40,
+                background="#FFFFFF", fieldbackground="#FFFFFF", foreground="#1F2A44")
+        style.configure("SetboardDetail.Treeview.Heading", font=("Meiryo UI", 12, "bold"),
+                background="#D8DEE6", foreground="#10203A", relief="flat")
+
+        self.configure(fg_color=C_BG)
+        self._tab_font = ctk.CTkFont(family="Meiryo UI", size=15, weight="bold")
+        self._label_font = ctk.CTkFont(family="Meiryo UI", size=11)
+        self._label_bold = ctk.CTkFont(family="Meiryo UI", size=11, weight="bold")
+        self._step_font = ctk.CTkFont(family="Meiryo UI", size=10, weight="bold")
+        self._btn_font = ctk.CTkFont(family="Meiryo UI", size=12)
+        self._run_font = ctk.CTkFont(family="Meiryo UI", size=14, weight="bold")
+
+        # ステータスバー
+        self.status_bar = ctk.CTkLabel(
+            self, text=f"前回実行: なし | 山数: - | パレット: - | メイン: - リリーフ: - | {self._version_label}",
+            fg_color=C_STATUS, text_color="#EDF2F4", font=self._label_font, anchor="w",
+        )
+        self.status_bar.pack(side="bottom", fill="x", ipady=5)
+
+        # 左ペイン
+        left = ctk.CTkFrame(self, fg_color=C_SIDEBAR, corner_radius=12, width=260)
+        left.pack(side="left", fill="both", padx=(8, 4), pady=8)
+        left.pack_propagate(False)
+        self.left_sidebar = left
+
+        left_top = ctk.CTkFrame(left, fg_color="transparent")
+        left_top.pack(side="top", fill="both", expand=True, padx=10, pady=(10, 0))
+
+        # ① 便名選択
+        ctk.CTkLabel(left_top, text="  ① 便名を選ぶ", fg_color=C_STEP1, text_color="white",
+                 font=ctk.CTkFont(family="Meiryo UI", size=13, weight="bold"),
+                 anchor="w", corner_radius=6, height=30).pack(fill="x", pady=(0, 4))
+        route_frame = ctk.CTkFrame(left_top, fg_color="transparent")
+        route_frame.pack(fill="x", pady=(0, 6))
+        route_sb = tk.Scrollbar(route_frame, orient="vertical")
+        self.route_list = tk.Listbox(route_frame, selectmode="extended", exportselection=False,
+                                     font=("Meiryo UI", 12), height=13,
+                                     bg="white", fg="#2B2D42",
+                                     selectbackground=C_ACCENT, selectforeground="white",
+                                     relief="flat", highlightthickness=1, highlightcolor="#D6DCE5",
+                                     highlightbackground="#D6DCE5", yscrollcommand=route_sb.set)
+        route_sb.configure(command=self.route_list.yview)
+        self.route_list.pack(side="left", fill="both", expand=True)
+        route_sb.pack(side="right", fill="y")
+        self.route_list.bind("<<ListboxSelect>>", lambda e: self.refresh_candidates())
+
+        self.summary_mode = tk.BooleanVar(value=True)
+
+        # 受入リスト（折りたたみ可能）
+        receipt_header = ctk.CTkFrame(left_top, fg_color="transparent")
+        self.receipt_toggle_btn = ctk.CTkButton(
+            receipt_header,
+            text="受入（まとめOFF時に選択） ▼",
+            command=self._toggle_receipt_section,
+            fg_color="transparent",
+            text_color=C_NEUTRAL,
+            hover_color="#E9EEF7",
+            anchor="w",
+            height=24,
+            corner_radius=6,
+            font=self._label_font,
+        )
+        self.receipt_toggle_btn.pack(side="left", fill="x", expand=True)
+
+        self.receipt_section = ctk.CTkFrame(left_top, fg_color="transparent")
+        receipt_frame = ctk.CTkFrame(self.receipt_section, fg_color="transparent")
+        receipt_frame.pack(fill="x", pady=(0, 6))
+        receipt_sb = tk.Scrollbar(receipt_frame, orient="vertical")
+        self.receipt_list = tk.Listbox(receipt_frame, selectmode="extended", exportselection=False,
+                                       font=("Meiryo UI", 10), height=3,
+                                       bg="white", fg="#2B2D42",
+                                       selectbackground=C_ACCENT, selectforeground="white",
+                                       relief="flat", highlightthickness=1, highlightcolor="#D6DCE5",
+                                       highlightbackground="#D6DCE5", yscrollcommand=receipt_sb.set)
+        receipt_sb.configure(command=self.receipt_list.yview)
+        self.receipt_list.pack(side="left", fill="both", expand=True)
+        receipt_sb.pack(side="right", fill="y")
+        self.receipt_list.bind("<<ListboxSelect>>", lambda e: self.refresh_orders_for_receipt())
+
+        # ② オーダー選択
+        order_header = ctk.CTkFrame(left_top, fg_color="transparent")
+        order_header.pack(fill="x", pady=(2, 0))
+        ctk.CTkLabel(order_header, text="  ② オーダーを選ぶ", 
+                     fg_color=C_STEP2, text_color="white",
+                     font=ctk.CTkFont(family="Meiryo UI", size=14, weight="bold"), 
+                     anchor="w", corner_radius=6, height=30).pack(fill="x", pady=(0, 4))
+        self._order_count_label = ctk.CTkLabel(left_top, text="0 件", 
+                                               font=self._label_font, text_color=C_NEUTRAL)
+        
+        order_frame = ctk.CTkFrame(left_top, fg_color="transparent")
+        order_frame.pack(fill="both", expand=True, pady=(0, 6))
+        order_sb = tk.Scrollbar(order_frame, orient="vertical")
+        self.order_list = tk.Listbox(order_frame, selectmode="extended", exportselection=False,
+                                     font=("Meiryo UI", 18, "bold"), height=8,
+                                     bg="white", fg="#2B2D42",
+                                     selectbackground=C_ACCENT, selectforeground="white",
+                                     relief="flat", highlightthickness=1, highlightcolor="#D6DCE5",
+                                     highlightbackground="#D6DCE5", yscrollcommand=order_sb.set)
+        order_sb.configure(command=self.order_list.yview)
+        
+        self.order_list.pack(side="left", fill="both", expand=True)
+        order_sb.pack(side="right", fill="y")
+        self.order_list.bind("<Double-Button-1>", lambda e: self.add_selection())
+        self._on_summary_mode_changed()
+
+
+        # 下部エリア（実行/操作ボタン）
+        left_bottom = ctk.CTkFrame(left, fg_color="transparent", height=210)
+        left_bottom.pack(side="bottom", fill="x", padx=10, pady=(0, 10), before=left_top)
+        left_bottom.pack_propagate(False)
+        # バッテリー交換を下部の操作エリアへ配置
+        battery_frame = ctk.CTkFrame(left_bottom, fg_color="transparent")
+        battery_frame.pack(side="top", fill="x", padx=8, pady=(4, 6))
+
+        ctk.CTkCheckBox(
+            battery_frame,
+            text="バッテリー交換を実施（メイン工程に差し込む）",
+            variable=self.enable_battery_change,
+            command=self._on_battery_change_toggled,
+            font=ctk.CTkFont(
+                family="Meiryo UI",
+                size=12,
+                weight="normal",
+            ),
+            checkbox_width=22,
+            checkbox_height=22,
+            height=26,
+            fg_color=C_ACCENT,
+            hover_color=C_ACCENT_HOVER,
+        ).pack(anchor="w")
+
+        self.progress_bar = ctk.CTkProgressBar(left_bottom, mode="indeterminate", progress_color=C_SUCCESS)
+        ctk.CTkButton(left_bottom, text="▶  仕分け＆セット実行", command=self.run,
+                      fg_color=C_SUCCESS, hover_color=C_SUCCESS_HOVER,
+                      font=self._run_font, height=56, corner_radius=10,
+                      ).pack(side="bottom", fill="x", pady=(6, 0))
+
+        btns = ctk.CTkFrame(left_bottom, fg_color="transparent")
+        btns.pack(side="bottom", fill="x", pady=(4, 0))
+        auto_reload_cfg = ctk.CTkFrame(left_bottom, fg_color="transparent")
+        auto_reload_cfg.pack(side="bottom", fill="x", pady=(2, 2))
+        ctk.CTkLabel(auto_reload_cfg, text="自動再読込", font=self._label_font,
+                     text_color=C_NEUTRAL).pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(auto_reload_cfg, text="毎時", font=self._label_font,
+                     text_color=C_NEUTRAL).pack(side="left")
+        ctk.CTkOptionMenu(
+            auto_reload_cfg,
+            values=[f"{i:02d}" for i in range(60)],
+            variable=self.auto_reload_minute_str,
+            command=self._on_auto_reload_minute_changed,
+            width=76,
+            height=28,
+            font=self._btn_font,
+            fg_color=C_INFO,
+            button_color=C_INFO,
+            button_hover_color=C_INFO_HOVER,
+            dropdown_font=self._label_font,
+        ).pack(side="left", padx=4)
+        ctk.CTkLabel(auto_reload_cfg, text="分", font=self._label_font,
+                     text_color=C_NEUTRAL).pack(side="left", padx=(2, 0))
+        ctk.CTkButton(btns, text="CSV再読込", command=self.reload_shipments_data, width=132,
+                  height=40, fg_color=C_WARN, hover_color=C_WARN_HOVER, font=self._btn_font,
+                  corner_radius=8).pack(side="left", padx=(6, 4))
+        ctk.CTkButton(btns, text="引継クリア", command=self.clear_lane_time_carryover, width=132,
+              height=40, fg_color=C_NEUTRAL, hover_color=C_NEUTRAL_HOVER, font=self._btn_font,
+              corner_radius=8).pack(side="left", padx=(4, 6))
+
+        # ④ 前回時刻選択（履歴管理）
+        shift_label = ctk.CTkLabel(btns, text="前回時刻選択", font=self._label_bold)
+        shift_label.pack(side="left", padx=(12, 4))
+        # 初期値：履歴が空なので「未計算」ラベル
+        initial_values = [
+            generate_lane_end_times_label(self.lane_end_times_history, "最新"),
+            generate_lane_end_times_label(self.lane_end_times_history, "1つ前"),
+        ]
+        self.history_combo = ttk.Combobox(btns, values=initial_values, state="readonly",
+                                          textvariable=self.selected_history_choice,
+                                          width=26, font=("Meiryo UI", 14), height=5)
+        self.selected_history_choice.set(initial_values[0])
+        self.history_combo.pack(side="left", padx=(0, 8))
+        if self.selected_history_choice.get() == "":
+            self.selected_history_choice.set("最新")
+
+        ctk.CTkButton(btns, text="追加", command=self.add_selection, width=70,
+                      fg_color=C_ACCENT, hover_color=C_ACCENT_HOVER, font=self._btn_font,
+                      corner_radius=8).pack(side="left", padx=(8, 2))
+
+        # 右ペイン: タブ
+        self.notebook = ctk.CTkTabview(self, corner_radius=12,
+                                        fg_color="#FFFFFF",
+                                        segmented_button_fg_color="#D4D9E8",
+                                        segmented_button_selected_color=C_ACCENT,
+                                        segmented_button_selected_hover_color=C_ACCENT_HOVER,
+                                        segmented_button_unselected_color="#D4D9E8",
+                        segmented_button_unselected_hover_color="#BDC4D6",
+                        command=self._on_main_tab_changed)
+        self.notebook.pack(side="left", fill="both", expand=True, padx=(4, 8), pady=8)
+
+        for tab_name in ["セットボード", "入車時間設定", "選択管理"]:
+            self.notebook.add(tab_name)
+        self.notebook._segmented_button.configure(
+            font=self._tab_font,
+            height=40,
+            text_color="#2B2D42",
+            text_color_disabled="#8D99AE",
+        )
+
+        # ===== セットボードタブ =====
+        tab_sb = self.notebook.tab("セットボード")
+        self._build_setboard_tab(tab_sb)
+
+        # ===== 入車時間設定タブ =====
+        tab_master = self.notebook.tab("入車時間設定")
+        self._build_master_tab(tab_master)
+
+        # ===== 選択管理タブ =====
+        tab_selection = self.notebook.tab("選択管理")
+        self._build_selection_tab(tab_selection)
+
+        # 初期表示はセットボード想定: 左ペインを隠してメイン領域を最大化
+        self.after(0, self._on_main_tab_changed)
+
+    def _on_main_tab_changed(self, *_):
+        """タブ切替時に左ペイン表示を切替える。"""
+        try:
+            current_tab = str(self.notebook.get())
+        except Exception:
+            current_tab = ""
+        self._set_selection_layout_mode(current_tab == "選択管理")
+
+    def _set_selection_layout_mode(self, show_left_sidebar: bool):
+        """選択管理タブでは左ペインを表示、他タブでは非表示にする。"""
+        if show_left_sidebar:
+            # 画面幅の約半分を左ペインへ割り当て
+            win_w = int(self.winfo_width()) if self.winfo_width() > 0 else 1500
+            sidebar_w = max(480, int(win_w * 0.46))
+            self.left_sidebar.configure(width=sidebar_w)
+
+            self.left_sidebar.pack_forget()
+            self.notebook.pack_forget()
+            self.left_sidebar.pack(side="left", fill="both", padx=(8, 4), pady=8)
+            self.notebook.pack(side="left", fill="both", expand=True, padx=(4, 8), pady=8)
+        else:
+            self.left_sidebar.pack_forget()
+            self.notebook.pack_forget()
+            self.notebook.pack(side="left", fill="both", expand=True, padx=(8, 8), pady=8)
+
+    def _configure_sb_columns(self, tree):
+        column_settings = {
+            "開始時間": {"width": 90, "minwidth": 70, "anchor": "w", "stretch": False},
+            "納入先": {"width": 120, "minwidth": 100, "anchor": "center", "stretch": False},
+            "ストア": {"width": 150, "minwidth": 120, "anchor": "center", "stretch": False},
+            "オーダー": {"width": 100, "minwidth": 90, "anchor": "center", "stretch": True},
+            "受入": {"width": 60, "minwidth": 50, "anchor": "center", "stretch": False},
+        }
+        for column_name in tree["columns"]:
+            tree.heading(column_name, text=column_name)
+            settings = column_settings[column_name]
+            tree.column(
+                column_name,
+                width=settings["width"],
+                minwidth=settings["minwidth"],
+                anchor=settings["anchor"],
+                stretch=settings["stretch"],
+            )
+
+    def _build_setboard_tab(self, tab):
+        """セットボード: メイン/リリーフ/あふれの3レーン表示"""
+        header_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        header_frame.pack(fill="x", padx=10, pady=(0, 0))
+        ctk.CTkLabel(header_frame, text="📋 セットボード（メイン / リリーフ / あふれ）",
+                     font=ctk.CTkFont(family="Meiryo UI", size=14, weight="bold"),
+                     anchor="w").pack(side="left")
+
+        lanes_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        lanes_frame.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+        lanes_frame.columnconfigure(0, weight=1)
+        lanes_frame.columnconfigure(1, weight=1)
+        lanes_frame.columnconfigure(2, weight=1)
+        lanes_frame.rowconfigure(0, weight=1)
+
+        # メインレーン
+        main_frame = ctk.CTkFrame(lanes_frame, fg_color=COLOR_MAIN, corner_radius=10)
+        main_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        ctk.CTkLabel(main_frame, text="1工程",
+                     font=ctk.CTkFont(family="Meiryo UI", size=13, weight="bold"),
+                     text_color="#1E3A5F").pack(pady=(8, 4))
+        self._sb_lane_columns = (
+            "開始時間", "納入先", "ストア", "オーダー", "受入"
+        )
+        self.sb_main_tree = ttk.Treeview(
+            main_frame,
+            columns=self._sb_lane_columns,
+            show="headings", height=8, style="SetboardLane.Treeview")
+        self._configure_sb_columns(self.sb_main_tree)
+        # スクロールバー設定
+        main_sb = tk.Scrollbar(main_frame, orient="vertical")
+        self.sb_main_tree.pack(side="left", fill="both", expand=True, padx=6, pady=(0, 8))
+        main_sb.pack(side="right", fill="y", pady=(0, 8))
+        self.sb_main_tree.configure(yscrollcommand=main_sb.set)
+        main_sb.config(command=self.sb_main_tree.yview)
+        self.sb_main_tree.bind("<Double-Button-1>", self._on_setboard_toggle_done)
+        self.sb_main_tree.tag_configure("mtn_even_summary", background="#D6E7FB", foreground="#0F274A", font=("Meiryo UI", 15, "bold"))
+        self.sb_main_tree.tag_configure("mtn_even_detail", background="#F4F8FF", foreground="#1F2A44", font=("MS Gothic", 18, "bold"))
+        self.sb_main_tree.tag_configure("mtn_even_detail_alt", background="#E9F1FC", foreground="#1F2A44", font=("MS Gothic", 18, "bold"))
+        self.sb_main_tree.tag_configure("mtn_odd_summary", background="#C7DCF5", foreground="#0F274A", font=("Meiryo UI", 15, "bold"))
+        self.sb_main_tree.tag_configure("mtn_odd_detail", background="#EAF3FF", foreground="#1F2A44", font=("MS Gothic", 18, "bold"))
+        self.sb_main_tree.tag_configure("mtn_odd_detail_alt", background="#DCEBFF", foreground="#1F2A44", font=("MS Gothic", 18, "bold"))
+        self.sb_main_tree.tag_configure("detail_break_main", background="#FFF3C4", foreground="#1F2A44", font=("Meiryo UI", 13))
+        self.sb_main_tree.tag_configure("mtn_even_summary_delay", background="#D6E7FB", foreground="#C62828", font=("Meiryo UI", 15, "bold"))
+        self.sb_main_tree.tag_configure("mtn_odd_summary_delay", background="#C7DCF5", foreground="#C62828", font=("Meiryo UI", 15, "bold"))
+        self.sb_main_tree.tag_configure("mtn_overflow_summary", background="#FFD6CC", foreground="#8C1D18", font=("Meiryo UI", 15, "bold"))
+        self.sb_main_tree.tag_configure("mtn_overflow_detail", background="#FFF2EE", foreground="#5A1E1A", font=("MS Gothic", 18, "bold"))
+        self.sb_main_tree.tag_configure("mountain_sep", foreground="#000000", background="#000000")
+        self.sb_main_tree.bind("<<TreeviewSelect>>", lambda e: self._on_setboard_select("main"))
+
+        # リリーフレーン
+        relief_frame = ctk.CTkFrame(lanes_frame, fg_color=COLOR_RELIEF, corner_radius=10)
+        relief_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        ctk.CTkLabel(relief_frame, text="リリーフ工程",
+                     font=ctk.CTkFont(family="Meiryo UI", size=13, weight="bold"),
+                     text_color="#831843").pack(pady=(8, 4))
+        self.sb_relief_tree = ttk.Treeview(
+            relief_frame,
+            columns=self._sb_lane_columns,
+            show="headings", height=8, style="SetboardLane.Treeview")
+        self._configure_sb_columns(self.sb_relief_tree)
+        # スクロールバー設定
+        relief_sb = tk.Scrollbar(relief_frame, orient="vertical")
+        self.sb_relief_tree.pack(side="left", fill="both", expand=True, padx=6, pady=(0, 8))
+        relief_sb.pack(side="right", fill="y", pady=(0, 8))
+        self.sb_relief_tree.configure(yscrollcommand=relief_sb.set)
+        relief_sb.config(command=self.sb_relief_tree.yview)
+        self.sb_relief_tree.bind("<Double-Button-1>", self._on_setboard_toggle_done)
+        self.sb_relief_tree.tag_configure("mtn_even_summary", background="#F7DCEB", foreground="#5E173D", font=("Meiryo UI", 15, "bold"))
+        self.sb_relief_tree.tag_configure("mtn_even_detail", background="#FFF7FC", foreground="#3F1E33", font=("MS Gothic", 18, "bold"))
+        self.sb_relief_tree.tag_configure("mtn_even_detail_alt", background="#FCEEF6", foreground="#3F1E33", font=("MS Gothic", 18, "bold"))
+        self.sb_relief_tree.tag_configure("mtn_odd_summary", background="#F0CFE1", foreground="#5E173D", font=("Meiryo UI", 15, "bold"))
+        self.sb_relief_tree.tag_configure("mtn_odd_detail", background="#FAE9F3", foreground="#3F1E33", font=("MS Gothic", 18, "bold"))
+        self.sb_relief_tree.tag_configure("mtn_odd_detail_alt", background="#F6DFEC", foreground="#3F1E33", font=("MS Gothic", 18, "bold"))
+        self.sb_relief_tree.tag_configure("detail_break_relief", background="#FFF3C4", foreground="#3F1E33", font=("Meiryo UI", 13))
+        self.sb_relief_tree.tag_configure("mtn_even_summary_delay", background="#F7DCEB", foreground="#C62828", font=("Meiryo UI", 15, "bold"))
+        self.sb_relief_tree.tag_configure("mtn_odd_summary_delay", background="#F0CFE1", foreground="#C62828", font=("Meiryo UI", 15, "bold"))
+        self.sb_relief_tree.tag_configure("mtn_overflow_summary", background="#FFD6CC", foreground="#8C1D18", font=("Meiryo UI", 15, "bold"))
+        self.sb_relief_tree.tag_configure("mtn_overflow_detail", background="#FFF2EE", foreground="#5A1E1A", font=("MS Gothic", 18, "bold"))
+        self.sb_relief_tree.tag_configure("mountain_sep", foreground="#000000", background="#000000")
+        self.sb_relief_tree.bind("<<TreeviewSelect>>", lambda e: self._on_setboard_select("relief"))
+
+        # あふれレーン
+        overflow_frame = ctk.CTkFrame(lanes_frame, fg_color=COLOR_OVERFLOW, corner_radius=10)
+        overflow_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
+        ctk.CTkLabel(overflow_frame, text="あふれ",
+                     font=ctk.CTkFont(family="Meiryo UI", size=13, weight="bold"),
+                     text_color="#7C4A00").pack(pady=(8, 4))
+        self.sb_overflow_tree = ttk.Treeview(
+            overflow_frame,
+            columns=self._sb_lane_columns,
+            show="headings", height=8, style="SetboardLane.Treeview")
+        self._configure_sb_columns(self.sb_overflow_tree)
+        # スクロールバー設定
+        overflow_sb = tk.Scrollbar(overflow_frame, orient="vertical")
+        self.sb_overflow_tree.pack(side="left", fill="both", expand=True, padx=6, pady=(0, 8))
+        overflow_sb.pack(side="right", fill="y", pady=(0, 8))
+        self.sb_overflow_tree.configure(yscrollcommand=overflow_sb.set)
+        overflow_sb.config(command=self.sb_overflow_tree.yview)
+        self.sb_overflow_tree.bind("<Double-Button-1>", self._on_setboard_toggle_done)
+        self.sb_overflow_tree.tag_configure("mtn_even_summary", background="#FFE0B2", foreground="#4E2A00", font=("Meiryo UI", 15, "bold"))
+        self.sb_overflow_tree.tag_configure("mtn_even_detail", background="#FFF8E8", foreground="#4E2A00", font=("MS Gothic", 18, "bold"))
+        self.sb_overflow_tree.tag_configure("mtn_even_detail_alt", background="#FFF0D0", foreground="#4E2A00", font=("MS Gothic", 18, "bold"))
+        self.sb_overflow_tree.tag_configure("mtn_odd_summary", background="#FFD180", foreground="#4E2A00", font=("Meiryo UI", 15, "bold"))
+        self.sb_overflow_tree.tag_configure("mtn_odd_detail", background="#FFF4DC", foreground="#4E2A00", font=("MS Gothic", 18, "bold"))
+        self.sb_overflow_tree.tag_configure("mtn_odd_detail_alt", background="#FFECC0", foreground="#4E2A00", font=("MS Gothic", 18, "bold"))
+        self.sb_overflow_tree.tag_configure("detail_break_overflow", background="#FFF3C4", foreground="#4E2A00", font=("Meiryo UI", 13))
+        self.sb_overflow_tree.tag_configure("mtn_overflow_summary", background="#FFD6CC", foreground="#8C1D18", font=("Meiryo UI", 15, "bold"))
+        self.sb_overflow_tree.tag_configure("mtn_overflow_detail", background="#FFF2EE", foreground="#5A1E1A", font=("MS Gothic", 18, "bold"))
+        self.sb_overflow_tree.tag_configure("mountain_sep", foreground="#000000", background="#000000")
+        self.sb_overflow_tree.bind("<<TreeviewSelect>>", lambda e: self._on_setboard_select("overflow"))
+
+    def _build_master_tab(self, tab):
+        """入車時間設定タブ"""
+        C_DANGER = "#E63946"
+        C_DANGER_HOVER = "#CF2F3C"
+        C_NEUTRAL = "#8D99AE"
+        C_NEUTRAL_HOVER = "#7A8598"
+
+        master_btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        master_btn_frame.pack(fill="x", padx=6, pady=6)
+        ctk.CTkButton(master_btn_frame, text="マスタ保存", command=self.save_master, width=100,
+                      font=self._btn_font, corner_radius=8).pack(side="left", padx=2)
+        ctk.CTkButton(master_btn_frame, text="行追加", command=self.add_master_row, width=80,
+                      font=self._btn_font, corner_radius=8).pack(side="left", padx=2)
+        ctk.CTkButton(master_btn_frame, text="選択行削除", command=self.delete_master_row, width=100,
+                      fg_color=C_DANGER, hover_color=C_DANGER_HOVER,
+                      font=self._btn_font, corner_radius=8).pack(side="left", padx=2)
+        # 入車時間設定専用の配色
+        style = ttk.Style()
+
+        style.configure(
+            "Master.Treeview",
+            font=("Meiryo UI", 12),
+            rowheight=36,
+            background="#FFFFFF",
+            fieldbackground="#FFFFFF",
+            foreground="#1E293B",
+            borderwidth=0,
+        )
+
+        style.configure(
+            "Master.Treeview.Heading",
+            font=("Meiryo UI", 12, "bold"),
+            background="#E2E8F0",
+            foreground="#334155",
+            relief="flat",
+        )
+
+        # 選択中は、フォーカスが外れても青＋白文字を維持
+        style.map(
+            "Master.Treeview",
+            background=[("selected", "#2563EB")],
+            foreground=[("selected", "#FFFFFF")],
+        )
+
+        style.map(
+            "Master.Treeview.Heading",
+            background=[("active", "#CBD5E1")],
+        )
+        
+        self.master_tree = ttk.Treeview(
+            tab,
+            columns=(
+                "OData_納入先",
+                "NONYUHIBIN",
+                "入車時間",
+                "セットありフラグ",
+            ),
+            show="headings",
+            height=20,
+            style="Master.Treeview",
+        )
+        for c in self.master_tree["columns"]:
+            self.master_tree.heading(c, text=c)
+
+            if c == "OData_納入先":
+                self.master_tree.column(
+                    c, width=220, anchor="w"
+                )
+            elif c == "セットありフラグ":
+                self.master_tree.column(
+                    c, width=160, anchor="center"
+                )
+            else:
+                self.master_tree.column(
+                    c, width=120, anchor="center"
+                )
+        self.master_tree.pack(
+            fill="both",
+            expand=True,
+            padx=6,
+            pady=(0, 6),
+        )
+        self.master_tree.bind("<Double-1>", self.edit_master_row)
+
+    def _build_selection_tab(self, tab):
+        """選択管理タブ: 選択一覧の確認/削除/クリアを行う。"""
+        top = ctk.CTkFrame(tab, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(
+            top,
+            text="選択一覧（Deleteキーで削除）",
+            font=ctk.CTkFont(family="Meiryo UI", size=16, weight="bold"),
+            anchor="w",
+        ).pack(side="left")
+
+        actions = ctk.CTkFrame(tab, fg_color="transparent")
+        actions.pack(fill="x", padx=10, pady=(0, 6))
+        ctk.CTkButton(
+            actions,
+            text="選択削除",
+            command=self.delete_selection,
+            width=90,
+            fg_color="#E63946",
+            hover_color="#CF2F3C",
+            font=self._btn_font,
+            corner_radius=8,
+        ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(
+            actions,
+            text="全クリア",
+            command=self.clear_selection,
+            width=90,
+            fg_color="#8D99AE",
+            hover_color="#7A8598",
+            font=self._btn_font,
+            corner_radius=8,
+        ).pack(side="left", padx=(0, 4))
+
+        list_wrap = ctk.CTkFrame(tab, fg_color="transparent")
+        list_wrap.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        sel_sb = tk.Scrollbar(list_wrap, orient="vertical")
+        style = ttk.Style()
+        style.configure("Selection.Treeview", font=("Meiryo UI", 14), rowheight=36)
+        style.configure("Selection.Treeview.Heading", font=("Meiryo UI", 14, "bold"))
+        self.sel_tree = ttk.Treeview(
+            list_wrap,
+            columns=("便名", "受入", "オーダー"),
+            show="headings",
+            height=18,
+            yscrollcommand=sel_sb.set,
+            style="Selection.Treeview",
+        )
+        sel_sb.configure(command=self.sel_tree.yview)
+        for c in ("便名", "受入", "オーダー"):
+            self.sel_tree.heading(c, text=c)
+            self.sel_tree.column(c, width=260, anchor="w")
+        self.sel_tree.pack(side="left", fill="both", expand=True)
+        sel_sb.pack(side="right", fill="y")
+        self.sel_tree.bind("<Delete>", lambda e: self.delete_selection())
+
+    # ===== 候補更新 =====
+    def refresh_routes(self):
+        self.route_list.delete(0, "end")
+        self._route_display_to_internal.clear()
+        routes = self.data_mgr.get_routes()
+        display_routes = []
+
+        for r in routes:
+            if r in SPLIT_UKEIRE_ROUTES and self.master_data is not None and not self.master_data.empty:
+                # 分割対象拠点は、master_data の "{route}-" で始まる行名を表示候補にする。
+                prefix = f"{r}-"
+                split_vendors = sorted(
+                    self.master_data[
+                        self.master_data["OData_納入先"].astype(str).str.startswith(prefix)
+                    ]["OData_納入先"].astype(str).unique().tolist()
+                )
+                if split_vendors:
+                    for vendor in split_vendors:
+                        display_routes.append(vendor)
+                        # "元町-1W" -> {"route": "元町", "ukeire": "1W"}
+                        ukeire = vendor[len(prefix):].strip() if vendor.startswith(prefix) else None
+                        self._route_display_to_internal[vendor] = {"route": r, "ukeire": ukeire}
+                else:
+                    # マスタ未整備時でも拠点が候補から消えないよう素名を残す。
+                    display_routes.append(r)
+                    self._route_display_to_internal[r] = {"route": r, "ukeire": None}
+            else:
+                display_routes.append(r)
+                self._route_display_to_internal[r] = {"route": r, "ukeire": None}  # 辞書化
+
+        # 「便名を選ぶ」欄の表示順
+        便名表示順 = [
+            "日野",
+            "織機-21",
+            "織機-28",
+            "織機-61",
+            "高岡",
+            "KVC-B3",
+            "KVC-B7",
+            "元町-1W",
+            "元町-PK",
+            "三栄",
+            "フタバ岡崎",
+            "額田広久手支給",
+            "日野補給引取",
+        ]
+
+        表示順位 = {
+            便名: 順位
+            for 順位, 便名 in enumerate(便名表示順)
+        }
+
+        # 指定外の便名は消さず、末尾に元の順番で表示
+        display_routes.sort(
+            key=lambda 便名: 表示順位.get(便名, len(便名表示順))
+        )
+
+        for r in display_routes:
+            self.route_list.insert("end", r)
+        self.refresh_candidates()
+
+
+    def _selection_exists_in_data(self, sel: dict) -> bool:
+        """選択済みレコードが再読込後データにも存在するか判定。"""
+        route = str(sel.get("便名", "")).strip()
+        receipt = str(sel.get("受入", "")).strip()
+        order = str(sel.get("オーダー", "")).strip()
+        if not route or not receipt or not order:
+            return False
+        mapping = self._route_display_to_internal.get(route, {"route": route, "ukeire": None})
+        if isinstance(mapping, str):  # 互換性: 古い形式
+            mapping = {"route": mapping, "ukeire": None}
+        internal_route = mapping["route"]
+        ukeire = mapping.get("ukeire")
+        
+        if internal_route not in set(self.data_mgr.get_routes()):
+            return False
+        orders = self.data_mgr.get_orders_for_route_receipt(internal_route, receipt, ukeire=ukeire)
+        return order in set(orders)
+
+    def reload_shipments_data(self, show_message: bool = True):
+        """出荷情報CSV/出荷場一覧CSVを再読込して候補を最新化。"""
+        try:
+            old_count = len(self.selections)
+            df_shipments, df_places = load_data()
+            self.data_mgr = DataManager(df_shipments, df_places)
+
+            # 既存選択は可能な限り維持し、現データにない項目のみ除外
+            self.selections = [s for s in self.selections if self._selection_exists_in_data(s)]
+            self.refresh_selection_tree()
+            self.refresh_routes()
+
+            removed = old_count - len(self.selections)
+            if show_message:
+                msg = "最新のCSVを再読込しました。"
+                if removed > 0:
+                    msg += f"\n現在データに存在しない選択を {removed} 件除外しました。"
+                messagebox.showinfo("CSV再読込", msg)
+            else:
+                self._last_auto_reload_success_at = datetime.now().strftime("%H:%M")
+                self._update_status()
+        except Exception as e:
+            if show_message:
+                messagebox.showerror("CSV再読込エラー", str(e))
+            else:
+                print(f"[自動再読込エラー] {e}")
+
+    def refresh_candidates(self):
+        routes = [self.route_list.get(i) for i in self.route_list.curselection()] or []
+        self.receipt_list.delete(0, "end")
+        self.order_list.delete(0, "end")
+        if not routes:
+            try:
+                self._order_count_label.configure(text="0 件")
+            except Exception:
+                pass
+            return
+        # 表示名から route/ukeire を抽出
+        routes_with_ukeire = []
+        for r in routes:
+            mapping = self._route_display_to_internal.get(r, {"route": r, "ukeire": None})
+            if isinstance(mapping, str):  # 互換性
+                mapping = {"route": mapping, "ukeire": None}
+            routes_with_ukeire.append(mapping)
+        
+        if not self.summary_mode.get():
+            receipts_all = set()
+            for route_info in routes_with_ukeire:
+                receipts_all.update(self.data_mgr.get_receipts_for_route(route_info["route"], ukeire=route_info.get("ukeire")))
+            for rc in sorted(receipts_all):
+                self.receipt_list.insert("end", rc)
+        orders_all = set()
+        if self.summary_mode.get():
+            for route_info in routes_with_ukeire:
+                orders_all.update(self.data_mgr.get_orders_for_route(route_info["route"], ukeire=route_info.get("ukeire")))
+        else:
+            receipts = [self.receipt_list.get(i) for i in self.receipt_list.curselection()]
+            if not receipts:
+                receipts = [self.receipt_list.get(i) for i in range(self.receipt_list.size())]
+            for route_info in routes_with_ukeire:
+                for rc in receipts:
+                    orders_all.update(self.data_mgr.get_orders_for_route_receipt(route_info["route"], rc, ukeire=route_info.get("ukeire")))
+        for od in sorted(orders_all, reverse=True):
+            self.order_list.insert("end", od)
+        try:
+            self._order_count_label.configure(text=f"{len(orders_all)} 件")
+        except Exception:
+            pass
+
+    def _set_receipt_section_expanded(self, expanded: bool):
+        self._receipt_section_expanded = bool(expanded)
+        if self._receipt_section_expanded:
+            if not self.receipt_section.winfo_ismapped():
+                self.receipt_section.pack(fill="x", pady=(0, 6))
+            self.receipt_toggle_btn.configure(text="受入（まとめOFF時に選択） ▲")
+        else:
+            if self.receipt_section.winfo_ismapped():
+                self.receipt_section.pack_forget()
+            self.receipt_toggle_btn.configure(text="受入（まとめOFF時に選択） ▼")
+
+    def _toggle_receipt_section(self):
+        if self.summary_mode.get():
+            return
+        self._set_receipt_section_expanded(not self._receipt_section_expanded)
+
+    def _on_summary_mode_changed(self):
+        if self.summary_mode.get():
+            self._set_receipt_section_expanded(False)
+            self.receipt_toggle_btn.configure(state="disabled")
+        else:
+            self._set_receipt_section_expanded(True)
+            self.receipt_toggle_btn.configure(state="normal")
+        # build_ui 中に呼ばれても安全なように、候補更新は部品初期化後のみ実行
+        if hasattr(self, "order_list") and hasattr(self, "route_list") and hasattr(self, "receipt_list"):
+            self.refresh_candidates()
+
+    def _on_battery_change_toggled(self):
+        """バッテリー交換チェックボックスが変更された時の処理。
+        現在は設定ファイルへの保存のみ。"""
+        try:
+            self._save_auto_reload_settings()
+        except Exception as e:
+            print(f"[warning] Failed to save battery change setting: {e}")
+
+    def refresh_orders_for_receipt(self):
+        if self.summary_mode.get():
+            return
+        routes = [self.route_list.get(i) for i in self.route_list.curselection()] or []
+        if not routes:
+            return
+        receipts = [self.receipt_list.get(i) for i in self.receipt_list.curselection()]
+        if not receipts:
+            return
+        self.order_list.delete(0, "end")
+        # 表示名から route/ukeire を抽出
+        routes_with_ukeire = []
+        for r in routes:
+            mapping = self._route_display_to_internal.get(r, {"route": r, "ukeire": None})
+            if isinstance(mapping, str):  # 互換性
+                mapping = {"route": mapping, "ukeire": None}
+            routes_with_ukeire.append(mapping)
+        
+        orders_all = set()
+        for route_info in routes_with_ukeire:
+            for rc in receipts:
+                orders_all.update(self.data_mgr.get_orders_for_route_receipt(route_info["route"], rc, ukeire=route_info.get("ukeire")))
+        for od in sorted(orders_all, reverse=True):
+            self.order_list.insert("end", od)
+        try:
+            self._order_count_label.configure(text=f"{len(orders_all)} 件")
+        except Exception:
+            pass
+
+    # ===== 選択操作 =====
+    def add_selection(self):
+        routes = [self.route_list.get(i) for i in self.route_list.curselection()]
+        orders = [self.order_list.get(i) for i in self.order_list.curselection()]
+        if not routes or not orders:
+            messagebox.showinfo("追加", "便名とオーダーを選択してください。")
+            return
+        new_items = []
+        if self.summary_mode.get():
+            for display_route in routes:
+                mapping = self._route_display_to_internal.get(display_route, {"route": display_route, "ukeire": None})
+                if isinstance(mapping, str):  # 互換性
+                    mapping = {"route": mapping, "ukeire": None}
+                internal_route = mapping["route"]
+                for od in orders:
+                    receipts = self.data_mgr.get_receipts_for_route_order(internal_route, od, ukeire=mapping.get("ukeire"))
+                    for rc in receipts:
+                        new_items.append({"便名": display_route, "受入": rc, "オーダー": od})
+        else:
+            receipts = [self.receipt_list.get(i) for i in self.receipt_list.curselection()]
+            if not receipts:
+                messagebox.showinfo("追加", "受入を選択してください。")
+                return
+            for display_route in routes:
+                mapping = self._route_display_to_internal.get(display_route, {"route": display_route, "ukeire": None})
+                if isinstance(mapping, str):  # 互換性
+                    mapping = {"route": mapping, "ukeire": None}
+                internal_route = mapping["route"]
+                for rc in receipts:
+                    for od in orders:
+                        new_items.append({"便名": display_route, "受入": rc, "オーダー": od})
+        uniq = {(s["便名"], s["受入"], s["オーダー"]) for s in (self.selections + new_items)}
+        self.selections = [{"便名": a, "受入": b, "オーダー": c} for (a, b, c) in sorted(uniq)]
+        self.refresh_selection_tree()
+
+    def delete_selection(self):
+        sel_iids = list(self.sel_tree.selection())
+        if not sel_iids:
+            messagebox.showinfo("削除", "選択一覧で削除対象を選んでください。")
+            return
+        keys_to_remove = set()
+        for iid in sel_iids:
+            vals = self.sel_tree.item(iid, "values")
+            if len(vals) >= 3:
+                keys_to_remove.add((str(vals[0]).strip(), str(vals[1]).strip(), str(vals[2]).strip()))
+        self.selections = [
+            s for s in self.selections
+            if (s["便名"].strip(), s["受入"].strip(), s["オーダー"].strip()) not in keys_to_remove
+        ]
+        for iid in sel_iids:
+            try:
+                self.sel_tree.delete(iid)
+            except Exception:
+                pass
+
+    def clear_selection(self):
+        self.selections = []
+        self.refresh_selection_tree()
+
+    def clear_lane_time_carryover(self):
+        # ③ 履歴を完全にリセット
+        if not save_lane_end_times_history([]):
+            messagebox.showerror("引継クリア失敗", "終了時刻履歴を保存できませんでした。履歴はクリアしていません。")
+            return
+        self.lane_end_times_history = []
+        cleared_values = [
+            generate_lane_end_times_label(self.lane_end_times_history, "最新"),
+            generate_lane_end_times_label(self.lane_end_times_history, "1つ前"),
+        ]
+        self.history_combo['values'] = cleared_values
+        self.selected_history_choice.set(cleared_values[0])
+        messagebox.showinfo("引継クリア", "工程別の引き継ぎ時刻をクリアしました。次回は初回動作になります。")
+
+    def refresh_selection_tree(self):
+        for iid in self.sel_tree.get_children():
+            self.sel_tree.delete(iid)
+        for s in self.selections:
+            a, b, c = s["便名"].strip(), s["受入"].strip(), s["オーダー"].strip()
+            self.sel_tree.insert("", "end", iid=f"{a}|{b}|{c}", values=(a, b, c))
+
+    def _confirm_previous_lane_end_times(self, previous_lane_end_times) -> bool:
+        """Issue #67: 2026-08-05 の履歴汚染事故（実際23:09に対し履歴20:12）の再発防止策。"""
+        previous_lane_end_times = previous_lane_end_times or {}
+
+        lane_pairs = [
+            (PROC_MAIN, "メイン"),
+            (PROC_RELIEF, "リリーフ"),
+            (PROC_OVERFLOW, "あふれ"),
+        ]
+        all_unset = True
+        lines = ["前回終了時刻を次回の開始下限として使用します。", ""]
+        for lane_key, lane_name in lane_pairs:
+            secs = int(previous_lane_end_times.get(lane_key, 0) or 0)
+            if secs > 0:
+                all_unset = False
+            hhmm = _seconds_to_hhmm(secs) if secs > 0 else "00:00"
+            lines.append(f"{lane_name}: {hhmm}")
+
+        if all_unset:
+            lines.append("")
+            lines.append("（引き継ぎ時刻なし・初回動作として実行します）")
+
+        lines.append("")
+        lines.append("この内容で実行しますか？")
+        return messagebox.askyesno("前回終了時刻の確認", "\n".join(lines))
+
+    # ===== 実行 =====
+    def run(self):
+        if not self.selections:
+            messagebox.showinfo("実行", "選択が空です。便名・受入・オーダーを追加してください。")
+            return
+        # ④ 履歴から選択値に基づいて前回の時刻を取得
+        previous_lane_end_times = select_lane_end_times(
+            self.lane_end_times_history,
+            normalize_choice_label(self.selected_history_choice.get())
+        )
+        if not self._confirm_previous_lane_end_times(previous_lane_end_times):
+            return
+        self.progress_bar.pack(fill="x", pady=(0, 4))
+        self.progress_bar.start()
+        self.title("実行中... CHかんばんセット")
+        self.update_idletasks()
+        try:
+            # 便名を内部名に変換（KVC-B7 -> KVC など）
+            converted_selections = []
+            for s in self.selections:
+                display_route = s["便名"]
+                mapping = self._route_display_to_internal.get(display_route, {"route": display_route, "ukeire": None})
+                if isinstance(mapping, str):  # 互換性
+                    mapping = {"route": mapping, "ukeire": None}
+                internal_route = mapping["route"]
+                ukeire = mapping.get("ukeire")
+                converted_selections.append({
+                    "便名": internal_route,
+                    "受入": s["受入"],
+                    "オーダー": s["オーダー"],
+                    "ukeire": ukeire,
+                })
+            
+            filtered, expanded, group_results, group_details, s1_summary, s1_details, _lane_end_times = run_pipeline(
+                self.data_mgr, converted_selections, self.height_cap.get(), self.mixing_key.get(),
+                master_df=self.master_data,
+                previous_lane_end_times=previous_lane_end_times,
+                return_lane_end_times=True,
+            )
+        except Exception as e:
+            self.progress_bar.stop()
+            self.progress_bar.pack_forget()
+            self.title("CHかんばんセット — 仕分け・セットボード")
+            messagebox.showerror("実行エラー", str(e))
+            return
+        self.filtered = filtered
+        self.expanded = expanded
+        self.group_results = group_results
+        self.group_details = group_details
+        self.size1_mixed_summary = s1_summary
+        self.size1_mixed_details = s1_details
+        # 工程割当
+        assignment_ok = self.recompute_process_assignment()
+        if not assignment_ok:
+            # エラー時は履歴を push しない（変更なし）
+            self.progress_bar.stop()
+            self.progress_bar.pack_forget()
+            self.title("CHかんばんセット — 仕分け・セットボード")
+            return
+
+        # ⑤ 実行成功時に確定した終了時刻を履歴に push（計算後のみ）
+        # self._last_lane_end_times は recompute_process_assignment 内で計算された確定値
+        result_times = dict(self._last_lane_end_times) if self._last_lane_end_times else {}
+        if result_times:
+            self.lane_end_times_history = push_lane_end_times(
+                self.lane_end_times_history,
+                result_times
+            )
+            # GUI落ち・仕分けミス時に巻き戻せるようファイルへ永続化
+            if not save_lane_end_times_history(self.lane_end_times_history):
+                messagebox.showwarning("終了時刻履歴の保存失敗", "今回の終了時刻を保存できませんでした。再起動後には復元されません。必要な時刻を控えてください。")
+            # 履歴更新後、combobox値を動的に再生成
+            updated_values = [
+                generate_lane_end_times_label(self.lane_end_times_history, "最新"),
+                generate_lane_end_times_label(self.lane_end_times_history, "1つ前"),
+            ]
+            self.history_combo['values'] = updated_values
+            # 現在の選択が有効でなくなった場合は「最新」を選択
+            if self.selected_history_choice.get() not in updated_values:
+                self.selected_history_choice.set(updated_values[0])
+
+        # 表示はセットボード中心（不要タブは非表示）
+        self.update_setboard_views()
+
+        # SPO出力
+        try:
+            if self.auto_export_csv:
+                self._auto_export_spo()
+        except Exception as e:
+            messagebox.showwarning("Excel出力", f"SPO用Excel出力でエラー: {e}")
+
+        self.progress_bar.stop()
+        self.progress_bar.pack_forget()
+        self.title("CHかんばんセット — 仕分け・セットボード")
+        self.notebook.set("セットボード")
+        self._on_main_tab_changed()
+        self._update_status()
+        self._show_unreachable_pair_warning_popup()
+        self._show_late_relief_warning_popup()
+        messagebox.showinfo("完了", "仕分け＆セット完了。セットボードで結果をご確認ください。")
+        # バッテリー交換は「その日だけ使う」運用のため、
+        # 出力完了後に自動でOFFへ戻す。
+        self.enable_battery_change.set(False)
+
+    def recompute_process_assignment(self):
+        """工程割当: メイン/リリーフの2工程に振り分け"""
+        try:
+            self.late_relief_warnings = []
+            self.all_mountain_details = build_all_mountain_details(
+                self.group_details, self.size1_mixed_details
+            )
+            if self.all_mountain_details is not None and not self.all_mountain_details.empty:
+                # GUI表示用は束ね前の展開明細を保持する。
+                self.all_mountain_details_display = self.all_mountain_details.copy()
+                # 【作業1】初回割付時に仮想山(-1)は混ぜない（この段階では-1を追加しない）
+                self.proc_details_display = compute_proc_details(self.all_mountain_details_display)
+
+                # 同一ストア内の異種HINBAN同梱を1パレットへ束ねる（エンジン投入前）。
+                # DataFrame->list[dict]->DataFrame 変換時は元列順を保持する。
+                base_cols = list(self.all_mountain_details.columns)
+                rows = self.all_mountain_details.to_dict(orient="records")
+                rows = cluster_by_store(rows)
+                clustered_df = pd.DataFrame(rows)
+                ordered_cols = [c for c in base_cols if c in clustered_df.columns]
+                extra_cols = [c for c in clustered_df.columns if c not in ordered_cols]
+                self.all_mountain_details = clustered_df.loc[:, ordered_cols + extra_cols].copy()
+                # 【作業1】初回割付時に仮想山(-1)は混ぜない（この段階では-1を追加しない）
+                self.proc_details = compute_proc_details(self.all_mountain_details)
+            else:
+                self.proc_details = compute_proc_details(self.size1_mixed_details) if (
+                    self.size1_mixed_details is not None and not self.size1_mixed_details.empty
+                ) else pd.DataFrame()
+                self.all_mountain_details_display = self.all_mountain_details.copy()
+                self.proc_details_display = self.proc_details.copy()
+
+            # 入車時間マスタベースで工程割当
+            # 画面上で編集中（未保存）の値を優先して使用する。
+            master_df = self._collect_master_from_tree()
+            if master_df.empty:
+                try:
+                    master_path = get_master_path()
+                    if master_path.exists():
+                        master_df = load_pickup_time_master_xlsx(master_path)
+                except Exception as e:
+                    print(f"入車時間マスタ読み込みエラー: {e}")
+
+            if not master_df.empty:
+                # ⑦ 工程割当時に履歴から選択値に基づいて時刻を取得
+                working_lane_end_times = select_lane_end_times(
+                    self.lane_end_times_history,
+                    normalize_choice_label(self.selected_history_choice.get())
+                )
+                self.mountain_proc, lane_end_times = assign_processes_by_arrival_time(
+                    self.proc_details,
+                    master_df,
+                    previous_lane_end_times=working_lane_end_times,
+                    return_lane_end_times=True,
+                )
+                # 計算結果を一時保存（成功後にpushするため）
+                self._last_lane_end_times = lane_end_times
+                # ⑥ 工程割当結果を作業用変数で保持（確定後にpush）
+                self.late_relief_warnings = self._collect_late_relief_warnings(master_df)
+                if "実開始時間" in self.mountain_proc.columns:
+                    self.mountain_start_times = dict(zip(
+                        self.mountain_proc["山通番"].astype(int),
+                        self.mountain_proc["実開始時間"].astype(str)
+                    ))
+                else:
+                    self.mountain_start_times = {}
+            else:
+                yamas = sorted(self.proc_details["山通番"].unique()) if not self.proc_details.empty else []
+                self.mountain_proc = pd.DataFrame({
+                    "山通番": yamas,
+                    "山工程": [PROC_MAIN] * len(yamas),
+                    "実開始時間": [""] * len(yamas),
+                        "照合追加180秒": [False] * len(yamas),
+                })
+                self.mountain_start_times = {}
+
+            self.mountain_proc_map = dict(zip(self.mountain_proc["山通番"], self.mountain_proc["山工程"]))
+
+            # [調査用] バッテリー OFF時の mountain_start_times を出力（ON時の5-5aと比較するため）
+            if not self.enable_battery_change.get():
+                print(
+                    "[BASELINE] mountain_start_times (OFF時): "
+                    f"{dict(sorted(self.mountain_start_times.items()))}"
+                )
+
+            # ===== ステップ5-1/5-2（準備のみ） =====
+            # 5-1: 実行ゲート。チェックがOFFなら統合ブロックには入らない。
+            # 5-2: メイン/リリーフの山リストと3つのmapを準備する（まだ入口関数は呼ばない）。
+            self.virtual_insert_context = None
+            self.virtual_insert_result = None
+            if self.enable_battery_change.get():
+                if self.proc_details is not None and not self.proc_details.empty and self.mountain_proc is not None and not self.mountain_proc.empty:
+                    # 既存スケジューラと同じ計算経路を再利用して、山ごとの工数/締切/開始情報を取得する。
+                    mountain_info, _prev_floor_map, work_map, deadline_map = _mountain_context(self.proc_details, master_df)
+                    start_floor_map = {
+                        int(m.get("山通番", 0)): int(m.get("開始時間_秒", 0) or 0)
+                        for m in mountain_info
+                    }
+
+                    # 現在の工程割当（山単位）から、明細行をメイン/リリーフに分ける。
+                    main_yamas = set(
+                        self.mountain_proc[
+                            self.mountain_proc["山工程"].astype(str) == PROC_MAIN
+                        ]["山通番"].astype(int).tolist()
+                    )
+                    relief_yamas = set(
+                        self.mountain_proc[
+                            self.mountain_proc["山工程"].astype(str) == PROC_RELIEF
+                        ]["山通番"].astype(int).tolist()
+                    )
+                    
+                    # 【案2実装】明細を山ごとに集約してからスケジューラに渡す
+                    # これにより、schedule_rows内での山の重複を防ぎ、
+                    # 後勝ち上書きでの時刻ずれを回避する。
+                    aggregated_rows = aggregate_proc_details_to_mountains(
+                        self.proc_details,
+                        main_yamas | relief_yamas,
+                        start_time_map=self.mountain_start_times,
+                    )
+                    main_lane_rows = [r for r in aggregated_rows if int(r.get("山通番", 0)) in main_yamas]
+                    relief_lane_rows = [r for r in aggregated_rows if int(r.get("山通番", 0)) in relief_yamas]
+
+                    # ステップ5-3以降で使えるように準備データを保持する。
+                    self.virtual_insert_context = {
+                        "main_lane_rows": main_lane_rows,
+                        "relief_lane_rows": relief_lane_rows,
+                        "work_map": work_map,
+                        "deadline_map": deadline_map,
+                        "start_floor_map": start_floor_map,
+                    }
+
+                    # 動作確認用ログ（ON時のみ）。
+                    print(
+                        "[step5-2] prepared "
+                        f"main_rows={len(main_lane_rows)}, relief_rows={len(relief_lane_rows)}, "
+                        f"work_keys={len(work_map)}, deadline_keys={len(deadline_map)}, start_floor_keys={len(start_floor_map)}"
+                    )
+
+                    # 5-3: 入口関数を1回だけ呼び、戻り値を受け取る（まだ画面データへは反映しない）。
+                    # virtual_row はスケジューラの時刻計算にのみ使用する。
+                    # 【作業1】proc_details への-1明細注入は step5-5a（時刻確定）後に step5-5c で別途1行だけ行う。
+                    battery_df = create_battery_change_mountain()
+                    virtual_row = battery_df.iloc[0].to_dict() if battery_df is not None and not battery_df.empty else {}
+                    result = insert_virtual_mountain_into_lane(
+                        main_lane_rows=main_lane_rows,
+                        relief_lane_rows=relief_lane_rows,
+                        virtual_row=virtual_row,
+                        work_map=work_map,
+                        start_floor_map=start_floor_map,
+                        deadline_map=deadline_map,
+                        main_limit_end_secs=None,
+                        min_gap_secs=10 * 60,
+                        virtual_time_window=None,
+                        lane_start_secs=None,
+                    )
+                    self.virtual_insert_result = result
+
+                    # 動作確認用ログ（ON時のみ）。
+                    before_main_yamas = set(int(r.get("山通番", 0)) for r in main_lane_rows)
+                    before_relief_yamas = set(int(r.get("山通番", 0)) for r in relief_lane_rows)
+                    after_main_yamas = set(int(r.get("山通番", 0)) for r in result.get("main_lane_rows", []))
+                    after_relief_yamas = set(int(r.get("山通番", 0)) for r in result.get("relief_lane_rows", []))
+                    virtual_in_main = any(is_virtual_yama(y) for y in after_main_yamas)
+                    virtual_in_relief = any(is_virtual_yama(y) for y in after_relief_yamas)
+                    evacuated_count = len(result.get("evacuated_existing_rows", []))
+                    print(
+                        "[step5-3] result "
+                        f"mode={result.get('insert_mode')}, "
+                        f"main_yamas_before={len(before_main_yamas)}, main_yamas_after={len(after_main_yamas)}, "
+                        f"relief_yamas_before={len(before_relief_yamas)}, relief_yamas_after={len(after_relief_yamas)}, "
+                        f"virtual_in_main={virtual_in_main}, virtual_in_relief={virtual_in_relief}, "
+                        f"evacuated_count={evacuated_count}, main_over_limit={result.get('main_over_limit')}"
+                    )
+
+                    # [step5-4a] 山所属を反映（mountain_proc_map を更新）
+                    # 戻り値の main_lane_rows / relief_lane_rows から山通番を抽出して
+                    # 新しい mountain_proc_map を構築。この段階では所属の更新だけ。
+                    # 時刻は後で 5-5 で更新する。
+                    
+                    new_mountain_proc_map = {}
+                    
+                    # main_lane_rows からメインに配置された山を抽出
+                    for r in result.get('main_lane_rows', []):
+                        yama_no = int(r.get('山通番', 0))
+                        new_mountain_proc_map[yama_no] = PROC_MAIN
+                    
+                    # relief_lane_rows からリリーフに配置された山を抽出
+                    for r in result.get('relief_lane_rows', []):
+                        yama_no = int(r.get('山通番', 0))
+                        new_mountain_proc_map[yama_no] = PROC_RELIEF
+                    
+                    # 仮想山 -1 も必ずメインに追加
+                    new_mountain_proc_map[VIRTUAL_YAMA_NO] = PROC_MAIN
+                    
+                    # mountain_proc_map を更新前の状態を保存
+                    before_proc_map_main = set(
+                        int(yama_no) for yama_no in self.mountain_proc_map.keys()
+                        if self.mountain_proc_map[yama_no] == PROC_MAIN
+                    )
+                    before_proc_map_relief = set(
+                        int(yama_no) for yama_no in self.mountain_proc_map.keys()
+                        if self.mountain_proc_map[yama_no] == PROC_RELIEF
+                    )
+                    
+                    # mountain_proc_map を更新
+                    self.mountain_proc_map.update(new_mountain_proc_map)
+                    
+                    # 更新後の状態を確認
+                    after_proc_map_main = set(
+                        int(yama_no) for yama_no in self.mountain_proc_map.keys()
+                        if self.mountain_proc_map[yama_no] == PROC_MAIN
+                    )
+                    after_proc_map_relief = set(
+                        int(yama_no) for yama_no in self.mountain_proc_map.keys()
+                        if self.mountain_proc_map[yama_no] == PROC_RELIEF
+                    )
+                    
+                    print(
+                        "[step5-4a] mountain_proc_map updated: "
+                        f"main_before={sorted(before_proc_map_main)}, main_after={sorted(after_proc_map_main)}, "
+                        f"relief_before={sorted(before_proc_map_relief)}, relief_after={sorted(after_proc_map_relief)}"
+                    )
+
+                    # [step5-4b] mountain_proc を新しい所属に合わせて再構築
+                    # 元のmountain_procから実開始時間・照合追加180秒などの情報を引き継ぎ、
+                    # new_mountain_proc_map の順序で新しいDataFrameを作成する。
+                    # 仮想山-1は元に居ないので、実開始時間は空のまま。時刻は5-5で入れる。
+                    
+                    new_rows = []
+                    
+                    # new_mountain_proc_map のすべての山（メイン・リリーフ・仮想山）をループ
+                    for yama_no in sorted(new_mountain_proc_map.keys()):
+                        proc = new_mountain_proc_map[yama_no]
+                        
+                        # 既存のmountain_procから対応する山の情報を探す
+                        existing_row = self.mountain_proc[self.mountain_proc["山通番"] == yama_no]
+                        
+                        if not existing_row.empty:
+                            # 既存の山: 元の情報を引き継ぐ（山工程は新しい所属で更新）
+                            row_dict = existing_row.iloc[0].to_dict()
+                            row_dict["山工程"] = proc  # 新しい所属で上書き
+                            new_rows.append(row_dict)
+                        else:
+                            # 新規の山（仮想山-1など）: 最小限の情報で新規作成
+                            new_rows.append({
+                                "山通番": yama_no,
+                                "山工程": proc,
+                                "実開始時間": "",  # 仮想山は時刻なし（5-5で入れる）
+                                "照合追加180秒": False,
+                            })
+                    
+                    # 新しいDataFrameを作成
+                    if new_rows:
+                        self.mountain_proc = pd.DataFrame(new_rows)
+                    else:
+                        self.mountain_proc = pd.DataFrame()
+                    
+                    # proc_details の工程列を新しい所属に合わせて更新
+                    if not self.proc_details.empty and self.mountain_proc_map:
+                        self.proc_details["工程"] = self.proc_details["山通番"].map(
+                            lambda y: str(self.mountain_proc_map.get(int(y), PROC_MAIN))
+                        )
+                    
+                    # proc_details_display（表示用）の工程列も更新（事故りやすい点③対策）
+                    if not self.proc_details_display.empty and self.mountain_proc_map:
+                        self.proc_details_display["工程"] = self.proc_details_display["山通番"].map(
+                            lambda y: str(self.mountain_proc_map.get(int(y), PROC_MAIN))
+                        )
+                    
+                    # 確認用ログ：再構築後のmountain_procの中身を表示
+                    print(
+                        "[step5-4b] mountain_proc rebuilt: "
+                        f"rows={len(self.mountain_proc)}, "
+                        f"yama_nos={sorted(self.mountain_proc['山通番'].astype(int).tolist())}, "
+                        f"procs={self.mountain_proc['山工程'].tolist()}"
+                    )
+
+                    # [step5-5a] schedule_rows から開始時刻を反映
+                    # main_schedule_rows / relief_schedule_rows の start_secs を HH:MM に変換して、
+                    # mountain_start_times と mountain_proc の実開始時間へ反映する。
+                    # この段階では時刻だけを更新し、警告の合流は 5-5b で行う。
+                    before_mountain_start_times = dict(self.mountain_start_times)
+                    schedule_rows = list(result.get("main_schedule_rows", [])) + list(result.get("relief_schedule_rows", []))
+                    updated_start_times = dict(self.mountain_start_times)
+
+                    for schedule_row in schedule_rows:
+                        yama_no = int(schedule_row.get("山通番", 0))
+                        start_secs = schedule_row.get("start_secs")
+                        if pd.isna(start_secs):
+                            continue
+                        start_hhmm = _seconds_to_hhmm(int(start_secs))
+                        updated_start_times[yama_no] = start_hhmm
+
+                    self.mountain_start_times = updated_start_times
+
+                    if not self.mountain_proc.empty and "山通番" in self.mountain_proc.columns and "実開始時間" in self.mountain_proc.columns:
+                        self.mountain_proc["実開始時間"] = self.mountain_proc["山通番"].map(
+                            lambda y: str(self.mountain_start_times.get(int(y), ""))
+                        )
+
+                    print(
+                        "[step5-5a] mountain_start_times updated: "
+                        f"before={dict(sorted(before_mountain_start_times.items()))}, "
+                        f"after={dict(sorted(self.mountain_start_times.items()))}, "
+                        f"virtual_minus_one={self.mountain_start_times.get(VIRTUAL_YAMA_NO, '')}"
+                    )
+
+                    # [step5-5c] 表示/出力用の仮想山(-1)明細を1行だけ注入する。
+                    # 【作業1の核】
+                    # - step5-5a（時刻確定）の直後に実行
+                    # - 注入前に既存の-1行を除去し、二重挿入を防止（常に1行保証）
+                    # - 初回割付（step5前）へは混ぜず、時刻が決まった後にのみ追加
+                    if self.proc_details is not None and not self.proc_details.empty:
+                        self.proc_details = self._inject_single_virtual_battery_row(self.proc_details)
+                    if self.proc_details_display is not None and not self.proc_details_display.empty:
+                        self.proc_details_display = self._inject_single_virtual_battery_row(self.proc_details_display)
+
+                    print(
+                        "[step5-5c] injected virtual detail row "
+                        f"proc_details={int(self.proc_details.get('山通番', pd.Series(dtype=float)).map(is_virtual_yama).sum())}, "
+                        f"proc_details_display={int(self.proc_details_display.get('山通番', pd.Series(dtype=float)).map(is_virtual_yama).sum())}"
+                    )
+
+                else:
+                    # 安全策: 元データが空の場合は準備を行わない。
+                    print("[step5-2] skipped: proc_details or mountain_proc is empty")
+
+            if not self.proc_details.empty and self.mountain_proc_map:
+                self.proc_details["工程"] = self.proc_details["山通番"].map(
+                    lambda y: str(self.mountain_proc_map.get(int(y), PROC_MAIN))
+                )
+            if not self.proc_details_display.empty and self.mountain_proc_map:
+                self.proc_details_display["工程"] = self.proc_details_display["山通番"].map(
+                    lambda y: str(self.mountain_proc_map.get(int(y), PROC_MAIN))
+                )
+            self.proc_summary = compute_proc_summary(self.proc_details, self.mountain_proc_map)
+            return True
+        except Exception as e:
+            messagebox.showerror("工程割当エラー", f"工程の再計算に失敗しました: {e}")
+            return False
+
+    def _build_virtual_battery_row_for_df(self, base_df: pd.DataFrame) -> dict:
+        """既存列構成に合わせて、表示/出力用の仮想山(-1)明細1行を作る。"""
+        row = {}
+        for col in base_df.columns:
+            if pd.api.types.is_numeric_dtype(base_df[col]):
+                row[col] = 0
+            else:
+                row[col] = ""
+
+        fixed_values = {
+            "山通番": VIRTUAL_YAMA_NO,
+            "工程": PROC_MAIN,
+            "工程内No": 1,
+            "納入先": "〔バッテリー交換〕",
+            "HINBAN": "BATTERY_CHANGE",
+            "引取工数_秒": 600,
+            "移動工数": 0,
+            "高さ": 0,
+        }
+        for col, val in fixed_values.items():
+            if col in base_df.columns:
+                row[col] = val
+
+        return row
+
+    def _inject_single_virtual_battery_row(self, df: pd.DataFrame) -> pd.DataFrame:
+        """既存-1行を除去した上で、仮想山(-1)明細を1行だけ注入する。"""
+        if df is None or df.empty or "山通番" not in df.columns:
+            return df
+
+        out = df.copy()
+        out = out.loc[~out["山通番"].map(is_virtual_yama)].copy()
+
+        row = self._build_virtual_battery_row_for_df(out if not out.empty else df)
+        virtual_df = pd.DataFrame([row], columns=out.columns if not out.empty else df.columns)
+        return pd.concat([out, virtual_df], axis=0, ignore_index=True)
+
+    def _collect_late_relief_warnings(self, master_df: pd.DataFrame):
+        """リリーフに割り振っても締切(入車 − PICKUP_DEADLINE_BUFFER_SECS)を超過する山を抽出する。"""
+        warnings = []
+        if self.proc_details is None or self.proc_details.empty:
+            return warnings
+        if self.mountain_proc is None or self.mountain_proc.empty:
+            return warnings
+        if master_df is None or master_df.empty:
+            return warnings
+
+        md = master_df.copy()
+        md["OData_納入先"] = md["OData_納入先"].astype(str).str.strip().map(_normalize_dest_name)
+        md["NONYUHIBIN"] = md["NONYUHIBIN"].astype(str).str.strip().str.translate(_ZEN2HAN_DIGIT_COLON)
+        md["NONYUHIBIN"] = pd.to_numeric(md["NONYUHIBIN"], errors="coerce").map(
+            lambda n: f"{int(n):02d}" if pd.notna(n) else ""
+        )
+        md["入車時間"] = md["入車時間"].astype(str).str.strip()
+        master_map = {(r["OData_納入先"], r["NONYUHIBIN"]): r["入車時間"] for _, r in md.iterrows()}
+
+        relief_rows = self.mountain_proc[self.mountain_proc["山工程"].astype(str) == PROC_RELIEF]
+        if relief_rows.empty:
+            return warnings
+
+        for _, rr in relief_rows.iterrows():
+            yama = int(rr["山通番"])
+            sub = self.proc_details[self.proc_details["山通番"] == yama]
+            if sub.empty:
+                continue
+
+            start_txt = str(rr.get("実開始時間", "")).strip()
+            start_secs = _to_operational_timeline_secs(_time_to_seconds(start_txt))
+            if start_secs is None:
+                continue
+
+            max_cost = pd.to_numeric(sub.get("移動工数", np.nan), errors="coerce")
+            max_cost_val = float(max_cost.max()) if max_cost.notna().any() else 0.0
+            pals = int(sub.shape[0])
+            work_secs = int(np.round(
+                max_cost_val + BASE_ONE_TIME + ((pals - 1) * MIDDLE_WORK) + (pals * BASE_PER_PAL), 0
+            ))
+            end_secs = _calc_work_end_with_breaks(start_secs, work_secs)
+
+            deadline_candidates = []
+            for _, drow in sub.iterrows():
+                vendor = _normalize_dest_name(str(drow.get("納入先", "")).strip())
+                nony = str(drow.get("NONYUHIBIN", "")).strip().translate(_ZEN2HAN_DIGIT_COLON)
+                order2 = nony[-2:] if len(nony) >= 2 else ""
+                if not vendor or not order2:
+                    continue
+                lookup_vendor = vendor
+                if vendor in SPLIT_UKEIRE_ROUTES:
+                    _ukeire = str(drow.get("UKEIRE", "")).strip()
+                    if _ukeire:
+                        lookup_vendor = f"{vendor}-{_ukeire}"
+                pickup = master_map.get((lookup_vendor, order2), "")
+                if (not pickup) and (lookup_vendor != vendor):
+                    # 安全網: 分割照合で未ヒット時のみ素名で1回フォールバックする。
+                    pickup = master_map.get((vendor, order2), "")
+                pickup_secs = _to_operational_timeline_secs(_time_to_seconds(pickup)) if pickup else None
+                if pickup_secs is None:
+                    continue
+                deadline_candidates.append(max(0, int(pickup_secs) - PICKUP_DEADLINE_BUFFER_SECS))
+
+            if not deadline_candidates:
+                continue
+            deadline_secs = min(deadline_candidates)
+            if end_secs > deadline_secs:
+                warnings.append({
+                    "山通番": yama,
+                    "開始": start_txt,
+                    "締切": f"{deadline_secs // 3600:02d}:{(deadline_secs % 3600) // 60:02d}",
+                })
+
+        warnings.sort(key=lambda x: x["山通番"])
+        return warnings
+
+    def _show_unreachable_pair_warning_popup(self):
+        """出荷場一覧に未登録で割り振れないデータを警告表示する（Issue #110 CD-2）。
+
+        オーダーは選べるのに受入が1件も出ないため無言で落ちていた行
+        （実測 85行/90パレット）を可視化する。到達不能が無ければ何も表示しない。
+        """
+        if getattr(self, "data_mgr", None) is None:
+            return
+        try:
+            message = self.data_mgr.build_unreachable_warning_message()
+        except Exception:
+            return
+        if not message:
+            return
+        messagebox.showwarning("未登録アラート", message)
+
+    def _show_late_relief_warning_popup(self):
+        """あふれ工程の山がある場合は警告ポップアップを表示する。"""
+        # あふれは process_assigner が PROC_OVERFLOW として判定済み
+        overflow_yamas = [
+            yama for yama, proc in self.mountain_proc_map.items()
+            if str(proc) == PROC_OVERFLOW
+        ]
+        if not overflow_yamas:
+            return
+        lines = [
+            f"全割当パターンを探索しても締切(入車{PICKUP_DEADLINE_BUFFER_SECS // 60}分前)に間に合わない山があります。",
+            f"対象山数: {len(overflow_yamas)}山（人工追加が必要）",
+            "",
+        ]
+        for yama in sorted(overflow_yamas)[:20]:
+            st = _to_display_hhmm_24h(self.mountain_start_times.get(int(yama), ""))
+            lines.append(f"山{yama}: 開始 {st}")
+        if len(overflow_yamas) > 20:
+            lines.append(f"... 他 {len(overflow_yamas) - 20} 山")
+        messagebox.showwarning("あふれアラート", "\n".join(lines))
+
+    def _auto_export_spo(self):
+        """SPO用Excel自動出力（出力先分離版）。
+        
+        - SPOアップロード用.xlsx → SPO監視フォルダ（Power Automate監視対象）
+        - 履歴・未ヒットCSV → ローカル固定フォルダ（トリガー対象外）
+        """
+        # 出力先を分離
+        dirs = resolve_spo_output_dirs(self.export_dir)
+        
+        # ローカル固定フォルダを事前作成（存在保証）
+        Path(dirs["history_dir"]).mkdir(parents=True, exist_ok=True)
+        Path(dirs["unmatched_dir"]).mkdir(parents=True, exist_ok=True)
+        
+        start_times = getattr(self, "mountain_start_times", {})
+        overflow_yamas = {
+            int(yama)
+            for yama, proc in self.mountain_proc_map.items()
+            if str(proc) == PROC_OVERFLOW
+        }
+        delay_map = {}
+        if self.mountain_proc is not None and not self.mountain_proc.empty and "照合追加180秒" in self.mountain_proc.columns:
+            delay_map = dict(zip(
+                self.mountain_proc["山通番"].astype(int),
+                self.mountain_proc["照合追加180秒"].fillna(False).astype(bool)
+            ))
+        deadline_exceeded_map = {}
+        if self.mountain_proc is not None and not self.mountain_proc.empty and "締切超過" in self.mountain_proc.columns:
+            deadline_exceeded_map = dict(zip(
+                self.mountain_proc["山通番"].astype(int),
+                self.mountain_proc["締切超過"].fillna(False).astype(bool)
+            ))
+
+        spo_df = build_spo_export_df(
+            self.proc_details,
+            self.mountain_proc_map,
+            start_times,
+            overflow_yamas=overflow_yamas,
+            inspection_delay_map=delay_map,
+            deadline_exceeded_map=deadline_exceeded_map,
+        )
+        master_df = pd.DataFrame()
+        try:
+            master_path = get_master_path()
+            master_df = load_pickup_time_master_xlsx(master_path)
+            # 未ヒット一覧CSVの出力先をローカルフォルダに変更
+            unmatched_path = Path(dirs["unmatched_dir"]) / "SPOアップロード用_未ヒット一覧.csv"
+            # ここでは本計算済みの mountain_start_times を使う。
+            # attach_pickup_start_time は、開始時間が空の行だけを後段で補完するフォールバック。
+            spo_df = attach_pickup_start_time(spo_df, master_df, unmatched_csv_path=unmatched_path)
+        except Exception:
+            pass
+        # Power Apps 表示用: GroupedData の各パレットに入車時間を書き込む。
+        # 工程割当と同じマスタを使うため、画面で編集中（未保存）の値を優先し、
+        # 空ならファイルから読んだマスタを使う。失敗しても出力は止めない。
+        try:
+            _entry_master = self._collect_master_from_tree()
+            if _entry_master is None or _entry_master.empty:
+                _entry_master = master_df
+            spo_df = attach_entry_time_to_groupeddata(spo_df, _entry_master)
+        except Exception:
+            logger.warning(
+                "GroupedData への入車時間の付与に失敗しました（入車時間なしで出力を続けます）",
+                exc_info=True,
+            )
+        if spo_df is not None and not spo_df.empty:
+            def _archive_result(report, output_path=None, result="出力"):
+                if not getattr(self, "archive_enabled", True):
+                    return
+                try:
+                    config = load_config()
+                    input_paths = []
+                    base_dir = config.get("base_dir")
+                    if base_dir:
+                        try:
+                            input_paths.append(_resolve_shipments_path(Path(base_dir)))
+                        except Exception:
+                            pass
+                    input_paths.append(get_master_path())
+                    archive_root = resolve_archive_dir(
+                        self.export_dir, self.archive_dir, LOCAL_OUTPUT_DIR
+                    )
+                    archive_export(
+                        output_path=output_path,
+                        input_paths=input_paths,
+                        export_df=self.all_mountain_details,
+                        report=report,
+                        settings_snapshot=config,
+                        archive_dir=archive_root,
+                        result=result,
+                    )
+                except Exception as archive_error:
+                    logger.error("出力アーカイブに失敗しました", exc_info=True)
+                    messagebox.showwarning(
+                        "出力アーカイブ",
+                        f"アーカイブに失敗しました。\n{archive_error}",
+                    )
+            warning_lines = []
+            # ファイル書き出し直前に、表示・束ね後・GroupedData の枚数を突合する。
+            report = verify_export_invariant(
+                self.all_mountain_details_display,
+                self.all_mountain_details,
+                spo_df,
+                "GroupedData",
+                audit_cost=getattr(self, "export_invariant_audit_cost", False),
+            )
+            title_by_yama = {
+                row.get("グループ番号"): row.get("タイトル", "")
+                for _, row in spo_df.iterrows()
+            }
+            if report.explained_bundle_yamas:
+                logger.info(
+                    "正当な束ねによるGroupedData件数差: %s",
+                    report.explained_bundle_yamas,
+                )
+            if report.is_unverifiable:
+                warning_lines.append(
+                    "出力の整合性を確認できませんでした。出力は行いましたが、かんばん照合を必ず実施してください。"
+                )
+            if report.is_lost and not report.is_unverifiable:
+                warning_lines.extend([
+                    "以下のパレットは出力ファイルに含まれていません。",
+                    "現物のかんばんで引取り（アナログ対応）をお願いします。",
+                ])
+                missing_lines = []
+                for row in report.missing_kanban[:20]:
+                    yama = row.get("山通番", "")
+                    title = title_by_yama.get(yama, "タイトル不明")
+                    missing_lines.append(
+                        f"{title}（山通番{yama}）/ {row.get('納入先', '')} / "
+                        f"{row.get('ストア', row.get('SYUKKASAKI', ''))} / "
+                        f"{row.get('NONYUHIBIN', '')} / {row.get('UKEIRE', '')} / "
+                        f"{row.get('SEBANGO', '')}"
+                    )
+                d5_count = sum(
+                    finding.check_name.startswith("D-5 誤った束ね")
+                    for finding in report.audit_findings
+                )
+                lost_count = len(report.missing_kanban) + d5_count
+                message = f"消失パレット: {lost_count}枚"
+                if missing_lines:
+                    warning_lines.append(
+                        "タイトル（山通番） / 納入先 / ストア / 便 / 受入 / SEBANGO\n" + "\n".join(missing_lines)
+                    )
+                warning_lines.append(message)
+                audit_lines = [
+                    f"{finding.title or title_by_yama.get(finding.group_number, 'タイトル不明')}"
+                    f"（山通番{finding.group_number}）/ {finding.check_name} "
+                    f"期待={finding.expected} 実測={finding.actual}"
+                    for finding in report.audit_findings
+                    if finding.severity == "ERROR"
+                ]
+                if audit_lines:
+                    warning_lines.append("出力ファイル監査:\n" + "\n".join(audit_lines[:20]))
+            if report.has_unexplained_count_gap:
+                stores = ", ".join(report.unexpanded_stores) or "不明"
+                warning_lines.append(f"束ね未展開を検知しました（ストア: {stores}）。\n{report.summary()}")
+            warning_audit_lines = [
+                f"{finding.title or title_by_yama.get(finding.group_number, 'タイトル不明')}"
+                f"（山通番{finding.group_number}）/ {finding.check_name} "
+                f"期待={finding.expected} 実測={finding.actual}"
+                for finding in report.audit_findings
+                if finding.severity == "WARNING"
+            ]
+            if warning_audit_lines:
+                print("出力ファイル監査警告:\n" + "\n".join(warning_audit_lines))
+                warning_lines.append("出力ファイル監査警告:\n" + "\n".join(warning_audit_lines[:20]))
+            # SPOアップロード用.xlsx はSPO監視フォルダへ（staging+timestamp+move方式）
+            spo_path = export_spo_xlsx_staged(spo_df, watch_dir=dirs["spo_xlsx_dir"])
+            try:
+                # 履歴はローカル固定フォルダへ
+                append_to_spo_history(spo_df, out_dir=dirs["history_dir"])
+            except Exception:
+                pass
+            try:
+                messagebox.showinfo("SPO出力", f"SPO用Excelを出力しました。\n{spo_path}")
+            except Exception:
+                pass
+            if spo_path and getattr(self, "archive_enabled", True):
+                _archive_result(report, spo_path, result="出力")
+            if warning_lines:
+                warning_message = "\n\n".join(warning_lines)
+                warning_message = "⚠️ 手作業での引取りが必要です\n" + warning_message
+                logger.error(warning_message)
+                messagebox.showwarning("⚠️ 手作業での引取りが必要です", warning_message)
+
+    # ===== タブ更新 =====
+    def update_basic_views(self):
+        for iid in self.basic_summary.get_children():
+            self.basic_summary.delete(iid)
+        df = compute_basic_groups(self.group_details, self.group_results, self.height_cap.get())
+        for _, row in df.iterrows():
+            values = [row[c] for c in self.basic_summary["columns"]]
+            tags = ("basic_mixed",) if str(row.get("混載", "")) == "★" else ()
+            self.basic_summary.insert("", "end", values=values, tags=tags)
+
+    def update_mix_views(self):
+        for iid in self.mix_summary.get_children():
+            self.mix_summary.delete(iid)
+        df = compute_mixed_groups(self.size1_mixed_summary, self.size1_mixed_details, self.height_cap.get())
+        for _, row in df.iterrows():
+            is_mixed = bool(row.get("混載フラグ", False))
+            star = "★" if is_mixed else ""
+            values = [star] + [row[c] for c in self.mix_summary["columns"] if c != "混載"]
+            tags = ("mixed_true",) if is_mixed else ()
+            self.mix_summary.insert("", "end", values=values, tags=tags)
+
+    def update_dest_views(self):
+        for iid in self.dest_summary.get_children():
+            self.dest_summary.delete(iid)
+        df = compute_dest_by_mountain(self.size1_mixed_details, self.size1_mixed_summary, self.height_cap.get())
+        for _, row in df.iterrows():
+            values = [row[c] for c in self.dest_summary["columns"]]
+            tag = ("dst_mixed",) if int(row.get("納入先数", 0)) >= 2 else ()
+            self.dest_summary.insert("", "end", values=values, tags=tag)
+
+    def update_kb_views(self):
+        if not hasattr(self, "kb_summary"):
+            return
+        for iid in self.kb_summary.get_children():
+            self.kb_summary.delete(iid)
+        if self.proc_summary is None or self.proc_summary.empty:
+            return
+        for _, row in self.proc_summary.iterrows():
+            yama = int(row.get("山通番"))
+            lab = str(self.mountain_proc_map.get(yama, PROC_MAIN))
+            lab_display = PROC_MAIN_LABEL if lab == PROC_MAIN else PROC_RELIEF_LABEL
+            start_time = self.mountain_start_times.get(yama, "")
+            vals = [
+                yama, lab_display,
+                row.get("メイン工程", 0),
+                row.get("リリーフ工程", 0),
+                row.get("合計", 0),
+                start_time,
+            ]
+            tag = ("proc_main" if lab == PROC_MAIN else "proc_relief",)
+            self.kb_summary.insert("", "end", values=vals, tags=tag)
+
+    @staticmethod
+    def _shorten_order(order) -> str:
+        s = str(order) if order is not None else ""
+        return s[-6:] if len(s) > 6 else s
+
+    def update_setboard_views(self):
+        """セットボードの3レーンを更新"""
+        for tree in (self.sb_main_tree, self.sb_relief_tree, self.sb_overflow_tree):
+            for iid in tree.get_children():
+                tree.delete(iid)
+        display_df = self.proc_details_display if (
+            self.proc_details_display is not None and not self.proc_details_display.empty
+        ) else self.proc_details
+        if display_df is None or display_df.empty:
+            return
+
+        def _start_sort_key(yama_no: int):
+            # Issue #45: 深夜跨ぎ便(00:xx)が先頭に飛ぶ不具合を修正。
+            # 判定境界03:00はexporter.py _start_key(Issue #43)と同一。
+            return _start_sort_key_for_test(self.mountain_start_times, yama_no)
+
+        yama_list = [int(y) for y in display_df["山通番"].unique()]
+        yama_list = sorted(yama_list, key=_start_sort_key)
+        inspection_delay_map = {}
+        if self.mountain_proc is not None and not self.mountain_proc.empty and "照合追加180秒" in self.mountain_proc.columns:
+            inspection_delay_map = dict(zip(
+                self.mountain_proc["山通番"].astype(int),
+                self.mountain_proc["照合追加180秒"].fillna(False).astype(bool)
+            ))
+
+        if not hasattr(self, "_done_yamas"):
+            self._done_yamas = set()
+        prev_yama_dest = None
+        prev_yama_order = None
+
+        for yama in yama_list:
+            sub = display_df[display_df["山通番"] == yama]
+            pal = int(sub.shape[0])
+            hsum = int(sub["高さ"].astype(float).sum()) if "高さ" in sub.columns else 0
+            max_cost = float(sub["移動工数"].max()) if sub["移動工数"].notna().any() else 0.0
+            # 仮想山(-1)は表示用の固定10分(600秒)を使い、通常式の台数連動から切り離す。
+            if is_virtual_yama(yama):
+                pick_cost = 600
+            else:
+                pick_cost = int(np.round(
+                    max_cost + BASE_ONE_TIME + ((pal - 1) * MIDDLE_WORK) + (pal * BASE_PER_PAL), 0
+                ))
+            from src.services.sorter import get_dest_list_for_group
+            dests = "/".join(get_dest_list_for_group(sub))
+            start_time = _to_display_hhmm_24h(self.mountain_start_times.get(int(yama), ""))
+            proc = self.mountain_proc_map.get(int(yama), PROC_MAIN)
+            
+            orders_in_yama = sub["NONYUHIBIN"].astype(str).str.strip().replace("", np.nan).dropna().unique().tolist()
+            is_mixed = len(orders_in_yama) > 1
+            dests_in_yama = sub["納入先"].astype(str).str.strip().unique().tolist() if "納入先" in sub.columns else []
+
+            # レーン振り分け
+            if proc == PROC_OVERFLOW:
+                target_tree = self.sb_overflow_tree
+            elif proc == PROC_MAIN:
+                target_tree = self.sb_main_tree
+            else:
+                target_tree = self.sb_relief_tree
+
+            if prev_yama_order is not None and not is_mixed and orders_in_yama and orders_in_yama[0] != prev_yama_order:  
+                target_tree.insert("", "end", values=("", "⚠オーダー", "", "", ""), tags=("change_banner",))  
+            if prev_yama_dest is not None and dests_in_yama and prev_yama_dest not in dests_in_yama:  
+                target_tree.insert("", "end", values=("", "⚠納入先", "", "", ""), tags=("change_banner",))  
+            prev_yama_order = orders_in_yama[0] if orders_in_yama else prev_yama_order
+            prev_yama_dest = dests_in_yama[0] if dests_in_yama else prev_yama_dest
+            parity = "even" if (int(yama) % 2 == 0) else "odd"
+            is_inspection_delayed = bool(inspection_delay_map.get(int(yama), False))
+            is_overflow = (proc == PROC_OVERFLOW)
+            summary_tag = "mtn_overflow_summary" if is_overflow else (
+                f"mtn_{parity}_summary_delay" if is_inspection_delayed else f"mtn_{parity}_summary"
+            )
+            detail_tag = "mtn_overflow_detail" if is_overflow else f"mtn_{parity}_detail"
+            # 仮想山は固定10分表示を優先し、照合+180の表記を付けない。
+            if is_virtual_yama(yama):
+                pick_cost_text = "600"
+            else:
+                pick_cost_text = f"{pick_cost} +180" if is_inspection_delayed else str(pick_cost)
+            section_label = "あふれ" if is_overflow else "山"
+
+            order_disp = f"🔀 混載({len(orders_in_yama)})" if is_mixed else (orders_in_yama[0] if orders_in_yama else "")
+            summary_tags = ("mixed_summary",) if is_mixed else (summary_tag,)
+            
+            # 完了判定を追加
+            done_key = (proc, int(yama))
+            header_label = f"✅ {start_time}" if done_key in self._done_yamas else f"{start_time}"
+            if done_key in self._done_yamas:
+                summary_tags = ("done_yama",)
+            
+            target_tree.insert("", "end", iid=f"sb:{proc}:{yama}",
+                values=(header_label, dests, "", self._shorten_order(order_disp), ""),
+                tags=summary_tags)
+            # 山配下の各パレット明細を同時表示
+            sub2 = sub.copy()
+            sub2["工程内No"] = pd.to_numeric(sub2.get("工程内No", 0), errors="coerce").fillna(0).astype(int)
+            # 移動工数列が存在しない山でも KeyError にならないようガード
+            if "移動工数" in sub2.columns:
+                sub2["移動工数"] = pd.to_numeric(sub2["移動工数"], errors="coerce")
+            else:
+                sub2["移動工数"] = float("nan")
+            sub2["高さ"] = pd.to_numeric(sub2.get("高さ", np.nan), errors="coerce")
+            sub2["_store_key"] = sub2.get("ストア", sub2.get("SYUKKASAKI", "")).astype(str).str.strip()
+            sub2["_order_key"] = sub2.get("NONYUHIBIN", "").astype(str).str.strip()
+            # GroupedData の「番号」と同じ並べ方(サイズ21先頭 → 移動工数昇順 → …)。
+            # ルールは exporter.sort_pallets_for_numbering の1か所だけで持つ(Issue #81)。
+            sub2 = sort_pallets_for_numbering(sub2, "納入先")
+            # 表示専用: 特例品番は作業者が山の最上段に置くため、└1（2枚なら└1・└2）に出す。
+            # GroupedData の番号は変えない。
+            sub2 = _special_hinban_first(sub2)
+            display_rows = list(sub2.iterrows())
+            prev_key = None
+            prev_row_dest = None
+            for idx, (_, row) in enumerate(display_rows, start=1):
+                store_text = str(row.get("ストア", row.get("SYUKKASAKI", ""))).strip()
+                order_text = str(row.get("NONYUHIBIN", "")).strip()
+                
+                # 【変更F-1】mixed/通常による detail_tags 決定
+                if is_mixed:
+                    detail_tags = ("mixed_detail",)
+                else:
+                    detail_tags = (detail_tag,)
+                
+                # 【変更F-2】納入先変更による dest_change_band 適用  
+                # 混載の山は山全体を黄色・同一フォントで統一するため、行単位の帯タグは付けない  
+                row_dest = str(row.get("納入先", row.get("OData_納入先", ""))).strip()  
+                if (not is_mixed) and prev_row_dest is not None and row_dest and row_dest != prev_row_dest:  
+                    detail_tags = detail_tags + ("dest_change_band",)  
+                if row_dest:  
+                    prev_row_dest = row_dest  
+                  
+                current_key = (store_text, order_text)  
+                if (not is_mixed) and prev_key is not None and current_key != prev_key:  
+                    break_tag = "detail_break_overflow" if proc == PROC_OVERFLOW else (
+                        "detail_break_main" if proc == PROC_MAIN else "detail_break_relief"
+                    )
+                    # 【修正1】break_tag を detail_tags に統合
+                    detail_tags = detail_tags + (break_tag,)
+                prev_key = current_key
+                
+                # 完了判定を追加
+                done_key = (proc, int(yama))
+                if done_key in self._done_yamas:
+                    detail_tags = ("done_yama",)
+                
+                # 【変更F-3】detail_tags を使用
+                target_tree.insert(
+                    "", "end", iid=f"sbd:{proc}:{yama}:{idx}",
+                    values=(
+                        f"└{idx}",
+                        str(row.get("納入先", row.get("OData_納入先", ""))),
+                        store_text,
+                        self._shorten_order(order_text),
+                        str(row.get("UKEIRE", "")),
+                    ),
+                    tags=detail_tags,
+                )
+
+            sub2 = sub2.drop(columns=["_store_key", "_order_key"], errors="ignore")
+
+            sep = tuple([""] * len(self._sb_lane_columns))
+            target_tree.insert("", "end", values=sep, tags=("mountain_sep",))
+            target_tree.tag_configure("mountain_sep", background="#000000")
+            target_tree.tag_configure("done_yama", foreground="#9e9e9e", background="#f5f5f5")
+            target_tree.tag_configure("mixed_summary", background="#FFF3C4", font=("Meiryo UI", 15, "bold"))  
+            target_tree.tag_configure("mixed_detail", background="#FFF3C4", font=("MS Gothic", 18, "bold"))  
+            target_tree.tag_configure("change_banner", foreground="#C62828", font=("Meiryo UI", 15, "bold"))  
+            target_tree.bind("<<TreeviewSelect>>", lambda e: self._on_setboard_select("main"))
+
+    def _on_setboard_select(self, source: str):
+        # 同時表示レイアウトのため、選択で他ビュー更新は行わない
+        return
+
+    def _on_setboard_toggle_done(self, event):
+        """Setboard のヘッダ行をダブルクリックして完了状態をトグルする"""
+        iid = event.widget.identify_row(event.y)
+        if not iid or not iid.startswith("sb:"):
+            return
+        
+        # iid から proc と yama を抽出
+        parts = iid.split(":")
+        if len(parts) < 3:
+            return
+        proc = parts[1]
+        try:
+            yama = int(parts[2])
+        except (ValueError, IndexError):
+            return
+        
+        done_key = (proc, yama)
+        if done_key in self._done_yamas:
+            self._done_yamas.discard(done_key)
+        else:
+            self._done_yamas.add(done_key)
+        
+        self.update_setboard_views()
+
+    # ===== 入車時間マスタ管理 =====
+    def _initial_load_master(self):
+        try:
+            master_path = get_master_path()
+            self.master_data = load_pickup_time_master_xlsx(master_path)
+            if not master_path.exists():
+                messagebox.showwarning("入車時間マスタ未配置", build_master_not_found_message(master_path))
+            self.refresh_master_tree()
+            self.refresh_routes()
+        except (MasterFileLockedError, MasterFileReadError) as e:
+            messagebox.showwarning("入車時間マスタ読込", str(e))
+        except Exception as e:
+            messagebox.showwarning("入車時間マスタ読込", str(e))
+
+    def save_master(self):
+        try:
+            master_df = self._collect_master_from_tree()
+            if master_df.empty:
+                messagebox.showwarning("マスタ保存", "保存するデータがありません。")
+                return
+            self.master_data = master_df.copy()
+            save_pickup_time_master_xlsx(self.master_data, get_master_path())
+            messagebox.showinfo("マスタ保存", f"保存しました。件数: {len(self.master_data)}件")
+        except Exception as e:
+            messagebox.showerror("マスタ保存エラー", str(e))
+
+    def _save_master_silent(self):
+        """ダイアログなしで入車時間マスタを保存（終了時オートセーブ用）。"""
+        master_df = self._collect_master_from_tree()
+        if master_df.empty:
+            return
+        self.master_data = master_df.copy()
+        save_pickup_time_master_xlsx(self.master_data, get_master_path())
+
+    def refresh_master_tree(self):
+        for iid in self.master_tree.get_children():
+            self.master_tree.delete(iid)
+
+        if self.master_data is None or self.master_data.empty:
+            return
+
+        self.master_tree.tag_configure(
+            "便名色0",
+            background="#ECFDF5",
+        )
+        self.master_tree.tag_configure(
+            "便名色1",
+            background="#D1FAE5",
+        )
+
+        便名タグ = {}
+        for i, row in self.master_data.iterrows():
+            便名 = str(row.get("OData_納入先", "")).strip()
+
+            # 同じ便名には同じ色を割り当てる
+            if 便名 not in 便名タグ:
+                便名タグ[便名] = f"便名色{len(便名タグ) % 2}"
+            self.master_tree.insert(
+                "",
+                "end",
+                iid=f"m:{i}",
+                values=(
+                    str(row.get("OData_納入先", "")),
+                    str(row.get("NONYUHIBIN", "")),
+                    str(row.get("入車時間", "")),
+                    self._display_set_flag(
+                        row.get("セットありフラグ", "")
+                    ),
+                ),
+                tags=(便名タグ[便名],),
+            )
+
+    @staticmethod
+    def _display_set_flag(value):
+        """ありだけ表示し、なしは空欄にする。"""
+        mark = set_flag_value_to_checkbox_mark(value)
+        return "あり" if mark == "☑" else ""
+
+    @staticmethod
+    def _parse_set_flag(text):
+        """画面表示を、既存の保存値に変換する。"""
+        text = str(text).strip()
+
+        if text == "あり":
+            text = "☑"
+        elif text in ("なし", ""):
+            text = "☐"
+
+        return checkbox_mark_to_set_flag_value(text)
+
+
+    def on_master_tree_click(self, event):
+        """4列目のクリックで、あり／なしを切り替える。"""
+        row_id = self.master_tree.identify_row(event.y)
+        col_id = self.master_tree.identify_column(event.x)
+
+        if not row_id or col_id != "#4":
+            return None
+
+        values = list(self.master_tree.item(row_id, "values"))
+
+        if len(values) < 4:
+            return "break"
+
+        current = str(values[3]).strip()
+        values[3] = "なし" if current in ("あり", "☑") else "あり"
+
+        self.master_tree.item(row_id, values=tuple(values))
+        self.master_tree.selection_set(row_id)
+
+        return "break"
+
+    def _collect_master_from_tree(self) -> pd.DataFrame:
+        """画面上の入車時間マスタ（未保存編集を含む）をDataFrame化する。"""
+        rows = []
+        try:
+            for iid in self.master_tree.get_children():
+                values = self.master_tree.item(iid, "values")
+                if len(values) < 3:
+                    continue
+                rows.append({
+                    "OData_納入先": str(values[0]).strip(),
+                    "NONYUHIBIN": str(values[1]).strip(),
+                    "入車時間": str(values[2]).strip(),
+                    "セットありフラグ": self._parse_set_flag(values[3]) if len(values) >= 4 else "",
+                })
+        except Exception:
+            return pd.DataFrame(columns=["OData_納入先", "NONYUHIBIN", "入車時間", "セットありフラグ"])
+        if not rows:
+            return pd.DataFrame(columns=["OData_納入先", "NONYUHIBIN", "入車時間", "セットありフラグ"])
+        return pd.DataFrame(rows)
+
+    def add_master_row(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("入車時間マスタ - 行追加")
+        dialog.geometry("460x270")
+        dialog.transient(self)
+        dialog.grab_set()
+        ctk.CTkLabel(dialog, text="OData_納入先:").grid(row=0, column=0, padx=14, pady=10, sticky="w")
+        dest_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=dest_var, width=240).grid(row=0, column=1, padx=10, pady=10)
+        ctk.CTkLabel(dialog, text="NONYUHIBIN:").grid(row=1, column=0, padx=14, pady=10, sticky="w")
+        bin_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=bin_var, width=240).grid(row=1, column=1, padx=10, pady=10)
+        ctk.CTkLabel(dialog, text="入車時間 (HH:MM):").grid(row=2, column=0, padx=14, pady=10, sticky="w")
+        time_var = tk.StringVar()
+        ctk.CTkEntry(dialog, textvariable=time_var, width=240).grid(row=2, column=1, padx=10, pady=10)
+        ctk.CTkLabel(
+            dialog, text="セット:"
+        ).grid(row=3, column=0, padx=14, pady=10, sticky="w")
+
+        set_var = tk.StringVar(value="0")
+
+        ctk.CTkCheckBox(
+            dialog,
+            text="セットあり",
+            variable=set_var,
+            onvalue="1",
+            offvalue="0",
+            font=ctk.CTkFont(family="Meiryo UI", size=13),
+            checkbox_width=24,
+            checkbox_height=24,
+            fg_color="#2563EB",
+            hover_color="#1D4ED8",
+        ).grid(row=3, column=1, padx=10, pady=10, sticky="w")
+
+        def do_add():
+            d, b, t = dest_var.get().strip(), bin_var.get().strip(), time_var.get().strip()
+            f = set_var.get().strip()
+            if not d or not b or not t:
+                messagebox.showwarning("入力エラー", "全ての項目を入力してください。")
+                return
+            try:
+                b = f"{int(b):02d}"
+            except Exception:
+                pass
+            new_id = f"m:new_{len(self.master_tree.get_children())}"
+            self.master_tree.insert(
+                "", "end", iid=new_id,
+                values=(d, b, t, self._display_set_flag(f))
+            )
+            dialog.destroy()
+
+        ctk.CTkButton(dialog, text="追加", command=do_add, fg_color="#28a745").grid(row=4, column=0, columnspan=2, pady=16)
+
+    def delete_master_row(self):
+        selection = self.master_tree.selection()
+        if not selection:
+            messagebox.showinfo("削除", "削除する行を選択してください。")
+            return
+        if not messagebox.askyesno("確認", f"{len(selection)}行を削除しますか？"):
+            return
+        for iid in selection:
+            self.master_tree.delete(iid)
+
+    def clear_master(self):
+        if not messagebox.askyesno("確認", "全てのマスタデータをクリアしますか？"):
+            return
+        for iid in self.master_tree.get_children():
+            self.master_tree.delete(iid)
+        self.master_data = pd.DataFrame(columns=["OData_納入先", "NONYUHIBIN", "入車時間", "セットありフラグ"])
+
+    def edit_master_row(self, event=None):
+        selection = self.master_tree.selection()
+        if not selection:
+            return
+        iid = selection[0]
+        values = self.master_tree.item(iid, "values")
+        if len(values) < 3:
+            return
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("入車時間マスタ - 行編集")
+        dialog.geometry("460x270")
+        dialog.transient(self)
+        dialog.grab_set()
+        ctk.CTkLabel(dialog, text="OData_納入先:").grid(row=0, column=0, padx=14, pady=10, sticky="w")
+        dest_var = tk.StringVar(value=values[0])
+        ctk.CTkEntry(dialog, textvariable=dest_var, width=240).grid(row=0, column=1, padx=10, pady=10)
+        ctk.CTkLabel(dialog, text="NONYUHIBIN:").grid(row=1, column=0, padx=14, pady=10, sticky="w")
+        bin_var = tk.StringVar(value=values[1])
+        ctk.CTkEntry(dialog, textvariable=bin_var, width=240).grid(row=1, column=1, padx=10, pady=10)
+        ctk.CTkLabel(dialog, text="入車時間 (HH:MM):").grid(row=2, column=0, padx=14, pady=10, sticky="w")
+        time_var = tk.StringVar(value=values[2])
+        ctk.CTkEntry(dialog, textvariable=time_var, width=240).grid(row=2, column=1, padx=10, pady=10)
+        ctk.CTkLabel(
+            dialog, text="セット:"
+        ).grid(row=3, column=0, padx=14, pady=10, sticky="w")
+
+        # 一覧が「あり」ならチェック付きで開く
+        set_var = tk.StringVar(
+            value="1"
+            if len(values) >= 4 and str(values[3]).strip() == "あり"
+            else "0"
+        )
+
+        ctk.CTkCheckBox(
+            dialog,
+            text="セットあり",
+            variable=set_var,
+            onvalue="1",
+            offvalue="0",
+            font=ctk.CTkFont(family="Meiryo UI", size=13),
+            checkbox_width=24,
+            checkbox_height=24,
+            fg_color="#2563EB",
+            hover_color="#1D4ED8",
+        ).grid(row=3, column=1, padx=10, pady=10, sticky="w")
+
+        def do_update():
+            d, b, t = dest_var.get().strip(), bin_var.get().strip(), time_var.get().strip()
+            f = set_var.get().strip()
+            if not d or not b or not t:
+                messagebox.showwarning("入力エラー", "全ての項目を入力してください。")
+                return
+            try:
+                b = f"{int(b):02d}"
+            except Exception:
+                pass
+            self.master_tree.item(
+                iid, values=(d, b, t, self._display_set_flag(f))
+            )
+            dialog.destroy()
+
+        ctk.CTkButton(dialog, text="更新", command=do_update, fg_color="#0d6efd").grid(row=4, column=0, columnspan=2, pady=16)
+
+    def import_from_ukeire_sheet(self):
+        from tkinter import filedialog
+        file_path = filedialog.askopenfilename(
+            title="受入データExcelを選択してください（全受入_納入便データシート）",
+            filetypes=[("Excel files", "*.xlsx *.xlsm *.xls"), ("All files", "*.*")],
+            parent=self)
+        if not file_path:
+            return
+        try:
+            df = parse_ukeire_ch_excel(Path(file_path), sheet_name="全受入_納入便データ")
+        except Exception as e:
+            messagebox.showerror("インポートエラー", str(e))
+            return
+
+        if df.empty:
+            messagebox.showwarning("インポート", "受入=CH の有効データを抽出できませんでした。")
+            return
+
+        vendor_counts = df.groupby("OData_納入先").size()
+        summary_lines = [f"  {v}: {n}件" for v, n in vendor_counts.items()]
+        msg = f"受入=CH で {len(df)} 件を抽出しました。\n\n【納入先別件数】\n" + "\n".join(summary_lines)
+        msg += "\n\n現在のマスタを置き換えますか？"
+        if not messagebox.askyesno("インポート確認", msg):
+            return
+
+        df_for_view = df.copy()
+        if "セットありフラグ" not in df_for_view.columns:
+            df_for_view["セットありフラグ"] = ""
+        df_for_view = df_for_view[["OData_納入先", "NONYUHIBIN", "入車時間", "セットありフラグ"]]
+        self.master_data = df_for_view.copy()
+        self.refresh_master_tree()
+        messagebox.showinfo("インポート完了", f"受入=CH の {len(df)} 件をインポートしました。")
+
+    def import_from_master_xlsx(self):
+        """入車時間マスタ.xlsx を直接読込して画面のマスタ表示を全置換する。"""
+        master_path = get_master_path()
+        try:
+            df = load_pickup_time_master_xlsx(master_path)
+        except Exception as e:
+            messagebox.showerror("取込エラー", str(e))
+            return
+
+        if df.empty:
+            if not messagebox.askyesno("取込確認", "マスタが空です。取込を続けますか？"):
+                return
+
+        if not messagebox.askyesno("取込確認", "既存の表示内容を取込内容で全置換します。よろしいですか？"):
+            return
+
+        self.master_data = df[["OData_納入先", "NONYUHIBIN", "入車時間", "セットありフラグ"]].copy()
+        self.refresh_master_tree()
+
+        messagebox.showinfo("取込完了", f"{master_path.name} から {len(df)} 件を取込しました。")
+
+
+# ============================================================
+# Issue #169: ログ設定（環境変数だけでトレースを採取できるようにする）
+# ============================================================
+def _setup_logging() -> None:
+    """起動時に一度だけログ設定を行う。
+
+    CH_LOG_LEVEL  : 既定 INFO。DEBUG/WARNING 等を指定可。
+    CH_TRACE_135  : 有効なら自動で DEBUG へ引き下げる（専用ランチャ不要にする）。
+    """
+    root = logging.getLogger()
+    if root.handlers:          # 二重設定防止（テスト・再import時）
+        return
+
+    trace_on = os.getenv("CH_TRACE_135", "") not in ("", "0", "false", "False")
+    level_name = os.getenv("CH_LOG_LEVEL", "DEBUG" if trace_on else "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    log_dir = Path(LOCAL_OUTPUT_DIR) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / ("trace_135.log" if trace_on else "ch_kanban.log")
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, mode="w", encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    # 他ライブラリの DEBUG でログが埋まるのを防ぐ
+    for noisy in ("matplotlib", "PIL", "openpyxl", "asyncio", "urllib3", "comtypes"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    logger.info("log level=%s trace135=%s file=%s",
+                logging.getLevelName(level), trace_on, log_path)
+
+
+def main():
+    _setup_logging()          # ★ App() より前に呼ぶ（ここが唯一の必須順序）
+    try:
+        app = App()
+    except Exception as e:
+        messagebox.showerror("起動エラー", str(e))
+        return
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

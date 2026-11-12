@@ -1,0 +1,157 @@
+# CHかんばんセット — システム構成
+
+## 1. 概要
+
+CH受入のかんばん仕分けと工程割当を行う業務アプリです。現行の主系統は `CustomTkinter GUI`（`src/app/gui.py`）で、
+処理結果をセットボード表示し、SPOアップロード用Excelを自動出力します。
+
+実装は「UI」と「ドメインロジック（仕分け/割当/出力）」を `src` 配下で分離しています。
+
+## 2. ディレクトリ構成（現行）
+
+```text
+CHかんばんセット/
+├─ src/
+│  ├─ app/
+│  │  └─ gui.py                    # CustomTkinterメインUI
+│  ├─ models/
+│  │  └─ constants.py              # 定数（工程名・休憩時間・工数式・色など）
+│  ├─ services/
+│  │  ├─ data_loader.py            # 入力データ読込・設定読込保存
+│  │  ├─ sorter.py                 # 仕分けパイプライン（山作成）
+│  │  ├─ process_assigner.py       # 既存割当ロジック（後方互換の基準）
+│  │  ├─ scheduler.py              # 新スケジューラ（EDF+同便クラスター+部分充填）
+│  │  ├─ exporter.py               # SPO/帳票/HTML出力
+│  │  └─ spo_export.py             # SPO出力の安全化（temp書込+同期待機）
+│  └─ utils/
+│     ├─ normalizer.py             # 文字列・時刻正規化
+│     ├─ csv_utils.py              # CSV読込補助
+│     └─ excel_utils.py            # Excel書込補助
+├─ config/
+│  └─ ch_kanban_settings.example.json # 配布・参照用の見本（通常設定ではない）
+├─ tests/
+│  ├─ unit/
+│  │  ├─ test_data_loader.py
+│  │  ├─ test_sorter.py
+│  │  └─ test_spo_export.py
+│  └─ integration/
+│     └─ __init__.py
+├─ qt_setboard/                    # PySide6/QML版セットボード（別系統）
+│  ├─ main.py
+│  ├─ models.py
+│  ├─ schedule.py
+│  ├─ service.py
+│  └─ qml/
+└─ docs/
+   ├─ requirements.md
+   ├─ architecture.md
+   ├─ 仕分け・割り振りルール.md
+   ├─ 利用マニュアル.md
+   └─ 起動・exe化ガイド.md
+```
+
+## 3. 主な依存関係
+
+```text
+gui.py
+  ├─ data_loader.py
+  │   ├─ csv_utils.py
+  │   └─ normalizer.py
+  ├─ sorter.py
+  │   └─ normalizer.py
+  ├─ process_assigner.py
+  │   ├─ constants.py
+  │   └─ normalizer.py
+  ├─ scheduler.py
+  │   ├─ process_assigner.py
+  │   ├─ constants.py
+  │   └─ normalizer.py
+  └─ exporter.py
+      ├─ spo_export.py
+      ├─ excel_utils.py
+      └─ constants.py
+```
+
+補足:
+- `scheduler.py` は `process_assigner.py` の関数/定数を再利用し、比較評価で採否判定します。
+- `exporter.py` は `spo_export.py` を経由してSPO出力の競合リスクを低減します。
+
+## 4. 実行フロー（GUI）
+> 要件定義における機能一覧との対応は [requirements.md](requirements.md) 3節を参照してください（旧 requirements.md 5節「データフロー」は本節に統合済み）。
+
+```text
+入力データ読込（CSV/Excel + 設定）
+  ↓
+選択条件（便名/受入/オーダー）で絞込
+  ↓
+直選択（1直 / 2直）
+  ↓
+同一直なら前回の工程終了時刻を引継ぎ
+  ↓
+sorter.run_pipeline（山作成・混載）
+  ↓
+process_assigner / scheduler による工程割当
+  ├─ 新スケジューラ結果が同等以上: 採用
+  └─ 劣後: 既存ロジックへフォールバック
+  ↓
+（任意）バッテリー交換ON時: 仮想山(-1)を時刻確定後に注入
+  ↓
+セットボード更新（メイン/リリーフ/あふれ）
+  ↓
+SPO用Excel自動出力
+  ├─ 未ヒット一覧CSV出力（必要時）
+  └─ 履歴追記（可能時）
+```
+
+## 5. 工程割当アーキテクチャ（CH固有）
+
+- 工程は `メイン` / `リリーフ` / `あふれ` の3区分です。
+- 締切は「入車時間 − `PICKUP_DEADLINE_BUFFER_SECS`」を基本に扱います（値は `docs/仕分け・割り振りルール.md` 付録A参照。現行は10分。2026-09-24 の現場合意で20分から変更）。
+- 休憩時間と照合180秒ルールを加味して開始/終了時刻を計算します。
+- メインとリリーフの両方で締切を満たせない山は `あふれ` として警告レーンへ表示します。
+
+## 6. データと設定
+
+- 入力データ:
+  - 出荷情報CSV（CH版優先）
+  - 出荷場一覧CSV
+  - 入車時間マスタExcel
+- 設定ファイル:
+  - `%LOCALAPPDATA%\CHKanban\ch_kanban_settings.json`（利用者別。`LOCALAPPDATA` 未設定時は本人ホームの `AppData\Local`）
+  - 主なキー: `base_dir`, `export_dir`, `auto_reload_minute`
+- 終了時刻履歴:
+  - `%LOCALAPPDATA%\CHKanban\lane_end_times_history.json`（利用者別。`LOCALAPPDATA` 未設定時は本人ホームの `AppData\Local`）
+- ローカル成果物・ログ:
+  - `%LOCALAPPDATA%\CHKanban\output` 配下（未ヒットCSV、履歴Excel、アプリログ、bat起動ログなど）
+  - `LOCALAPPDATA` 未設定時は本人ホームの `AppData\Local\CHKanban\output`
+- SPO本体Excel:
+  - 設定された `export_dir`（利用者が指定するSPO監視フォルダ）
+
+設定・履歴・ローカル出力は `src/utils/user_paths.py` で実行ユーザー領域へ解決します。リポジトリ内の `config/ch_kanban_settings.example.json` は見本であり、通常起動時の実設定ではありません。配置方式別の起動・更新手順は [環境構築手順書.md](環境構築手順書.md) を参照してください。
+
+## 6.5 メモリ内管理（セッション期間中）
+
+- 工程別引継ぎ時刻: 同一直での連続実行時に前回の各工程終了時刻を保持
+  - `selected_shift` の値（1直 / 2直）と同じ直で再実行した場合のみ利用
+  - 直が切り替わる、または「引継クリア」で自動/手動リセット
+  - アプリ再起動で自動クリア
+
+## 7. 出力物
+
+| 出力物 | 通常保存先 |
+|---|---|
+| `SPOアップロード用.xlsx`（主出力） | 利用者が指定した `export_dir` |
+| `SPOアップロード用_未ヒット一覧.csv`（未ヒットがある場合） | `%LOCALAPPDATA%\CHKanban\output` |
+| `SPOアップロード用_履歴.xlsx` | `%LOCALAPPDATA%\CHKanban\output` |
+| アプリログ・bat起動ログ | `%LOCALAPPDATA%\CHKanban\output\logs` |
+
+`LOCALAPPDATA` が未設定の場合は、これらのローカル保存先を本人ホームの `AppData\Local\CHKanban` 以下に置き換えます。Excelのローカル保存完了はOneDriveからSPOへの同期完了を意味しません。
+
+- 補助出力（ユーティリティとして実装済み）:
+  - セットボードHTML
+  - 工程別かんばん明細Excel
+
+## 8. 補足（別系統UI）
+
+`qt_setboard` は PySide6/QML のタイムラインUI実装です。現行運用の主系統は `src/app/gui.py` であり、
+`qt_setboard` は検証・拡張用の別系統として扱います。

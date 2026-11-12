@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# 一時出力ファイル
+tmp_*.xlsx
+tmp_*/
+
+# 環境・エディタ
+.venv/
+.vscode/
+*.log
+trace_135.log
+
+# 実行時の生成ファイル（テスト・出力用）
+SPOアップロード用_履歴.xlsx
+SPOアップロード用_未ヒット一覧.csv
+test_output.txt
+
+# 前回仕分け終了時刻の履歴（端末ごとの作業結果なので共有しない）
+config/lane_end_times_history.json
+lane_end_times_history.json
+
+# AI作業ログ・一時ファイル（ローカル作業時の中間生成物）
+/t1[0-9][0-9]*_*.txt
+/t1[0-9][0-9]*_*.py
+/_tmp_*
+/temp_*
+/.gh_issue_body.txt
+
+# 入車時間マスタ（データはGit管理外）
+入車時間マスタ.xlsx
+
+# Issue #90: 実運用データは追跡しない（ローカル配置のみ）
+SPOアップロード用.xlsx
+_export_archive/
+*_audit.csv
+
+# Excel のロックファイル
+~$*
+
+scripts/tmp/
+_pool_*
+trace135_*
+
+config/ch_kanban_settings.json

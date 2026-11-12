@@ -1,0 +1,1743 @@
+# -*- coding: utf-8 -*-
+"""CHかんばんセット — 仕分けロジック（グループ化・混載・山統合）"""
+
+import os
+import math
+import logging
+from typing import Optional, Dict
+import pandas as pd
+import numpy as np
+
+from ..models.constants import (
+    DEFAULT_HEIGHT_CAP, DEFAULT_MIXING_KEY,
+    SPECIAL_HINBAN, SPECIAL_HINBAN_HEIGHT_CAP,
+    BASE_ONE_TIME, MIDDLE_WORK, BASE_PER_PAL,
+    SIZE5_TYPE, SIZE5_MAX_PALLETS_PER_YAMA,
+    SPLIT_UKEIRE_ROUTES, HINO_VENDOR_PREFIX, PICKUP_DEADLINE_BUFFER_SECS,
+    MAX_BINS_PER_YAMA,
+    R7_YAMA_TOLERANCE,
+    REFILL_YAMAS_ENABLED, REFILL_MAX_SEARCH_NODES,
+)
+from ..utils.normalizer import (
+    _normalize_dest_name, _normalize_hhmm, _ZEN2HAN_DIGIT_COLON,
+)
+from ..utils.master_map import build_master_map_with_duplicate_warning
+from .bin_time_rules import build_bin_time_map, attach_unit_time_bounds, unit_floor_deadline
+from .process_assigner import _adjust_start_for_breaks, _calc_work_end_with_breaks
+
+
+logger = logging.getLogger(__name__)
+
+
+DEBUG_TARGET_VENDOR = "高岡"
+DEBUG_TARGET_NONYUHIBIN = "2026062503"
+TAKAOKA_TARGET_UKEIRE = "K5"
+# サイズ種類17は全出荷先で高さ2500まで積載可（最大3パレット）。
+# 通常の高さ上限DEFAULT_HEIGHT_CAP(2450)に対する特例。
+# 複数出荷先が共通でサイズ17パレットを引き取るため。2026/06 Kawasaki氏確認。
+SIZE17_MERGE_HEIGHT_CAP = 2500.0
+SIZE17_TYPE = "17"
+# ===== Issue #135 計測用トレース（既定OFF・挙動は変えない） =====
+# 有効化: 環境変数 CH_TRACE_135=1 もしくは sorter.TRACE_MIX = True
+TRACE_MIX = os.getenv("CH_TRACE_135", "") not in ("", "0", "false", "False")
+
+
+def _trace_on() -> bool:
+    return bool(TRACE_MIX) and logger.isEnabledFor(logging.DEBUG)
+
+
+def _join_uniq(s) -> str:
+    return "/".join(sorted(set(map(str, s))))
+
+# ===== Issue #146: アイル(ストア先頭1文字)ヘルパー =====
+def _aisle_of(store) -> str:
+    """ストア列（例: C15-A-3）からアイル（先頭1文字）を取り出す。空/欠損は空文字。"""
+    if store is None or (isinstance(store, float) and pd.isna(store)):
+        return ""
+    s = str(store).strip()
+    return s[:1] if s else ""
+
+
+def _add_aisle_column(df: pd.DataFrame) -> pd.DataFrame:
+    """ストア列からアイル（先頭1文字）を _aisle 列として付与する。"""
+    if "ストア" not in df.columns:
+        df["_aisle"] = ""
+        return df
+    df["_aisle"] = df["ストア"].apply(_aisle_of)
+    return df
+
+
+def _aisle_set(series: pd.Series) -> frozenset:
+    """グループ内に出現するアイルの集合（空文字は除外）を返す。"""
+    return frozenset(a for a in series.astype(str) if a)
+
+
+# ===== 山組みのエリア・列（docs/要件_山組みエリア列集約.md R1） =====
+# ストアを「-」で区切った1つ目がエリア（Q10）、1〜2つ目が列（Q10-A）。
+# 「-」が無い・空・欠損のストアは「不明」とし、場所でまとめる段階の対象外にする（R4 段階5・6 でだけ混ぜる）。
+UNKNOWN_STORE_AREA = "不明"
+
+
+def _area_row_of(store) -> tuple:
+    """ストア（例: Q10-A-24）からエリア（Q10）と列（Q10-A）を取り出す。"""
+    if store is None or (isinstance(store, float) and pd.isna(store)):
+        return UNKNOWN_STORE_AREA, UNKNOWN_STORE_AREA
+    parts = [p.strip() for p in str(store).strip().split("-")]
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return UNKNOWN_STORE_AREA, UNKNOWN_STORE_AREA
+    return parts[0], f"{parts[0]}-{parts[1]}"
+
+
+def _add_area_row_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """ストア列からエリア（_area）と列（_row）を付与する。ストア列が無ければ全行「不明」。"""
+    if "ストア" not in df.columns:
+        df["_area"] = UNKNOWN_STORE_AREA
+        df["_row"] = UNKNOWN_STORE_AREA
+        return df
+    pairs = df["ストア"].map(_area_row_of)
+    df["_area"] = pairs.map(lambda p: p[0])
+    df["_row"] = pairs.map(lambda p: p[1])
+    return df
+
+
+def _target_takaoka_mask(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    idx = df.index
+    vendor_src = (
+        df["納入先"] if "納入先" in df.columns
+        else (df["SYUKKASAKI"] if "SYUKKASAKI" in df.columns else pd.Series("", index=idx))
+    )
+    vendor_norm = vendor_src.astype(str).map(_normalize_dest_name)
+    nony = (
+        df["NONYUHIBIN"].astype(str).str.strip().str.translate(_ZEN2HAN_DIGIT_COLON)
+        if "NONYUHIBIN" in df.columns else pd.Series("", index=idx)
+    )
+    ukeire = df["UKEIRE"].astype(str).str.strip() if "UKEIRE" in df.columns else pd.Series("", index=idx)
+    return (
+        vendor_norm.eq(DEBUG_TARGET_VENDOR)
+        & nony.eq(DEBUG_TARGET_NONYUHIBIN)
+        & ukeire.eq(TAKAOKA_TARGET_UKEIRE)
+    )
+
+
+# ===== 入車時間列の付与 =====
+def _add_arrival_time_column(df: pd.DataFrame, master_df: pd.DataFrame) -> pd.DataFrame:
+    if master_df is None or master_df.empty:
+        df["入車時間"] = ""
+        return df
+    master = master_df.copy()
+    master["OData_納入先"] = master["OData_納入先"].astype(str).str.strip().apply(_normalize_dest_name)
+    master["NONYUHIBIN"] = master["NONYUHIBIN"].astype(str).str.strip().str.translate(_ZEN2HAN_DIGIT_COLON)
+    master["入車時間"] = master["入車時間"].astype(str).str.strip()
+    master_map = build_master_map_with_duplicate_warning(
+        master.to_dict("records"), ("OData_納入先", "NONYUHIBIN"), "入車時間", logger
+    )
+
+    def _lookup(row):
+        vendor = _normalize_dest_name(str(row.get("納入先", row.get("SYUKKASAKI", ""))))
+        # 分割対象拠点は UKEIRE を連結したマスタキーで照合する。
+        if vendor in SPLIT_UKEIRE_ROUTES:
+            ukeire = str(row.get("UKEIRE", "")).strip()
+            if ukeire:
+                vendor = f"{vendor}-{ukeire}"
+        nony = str(row.get("NONYUHIBIN", "")).strip().translate(_ZEN2HAN_DIGIT_COLON)
+        order2 = nony[-2:] if len(nony) >= 2 else ""
+        return master_map.get((vendor, order2), "")
+
+    df["入車時間"] = df.apply(_lookup, axis=1)
+    return df
+
+
+def _add_truck_key_column(df: pd.DataFrame) -> pd.DataFrame:
+    """入車時間からIssue #135のトラック単位キーを付与する。"""
+    # 天候不順や稼働停止で出荷日がずれ、同じ便を別の日に運ぶ運用があるため、
+    # 納入日が異なっても同じ入車時間なら物理的に同一トラックとして混載を許可する。
+    # ドラックヤードは1つだけで同時刻に複数トラックは入れないため、入車時間だけで一意に識別できる。
+    def _key(row: pd.Series) -> str:
+        arrival = row.get("入車時間", "")
+        if pd.isna(arrival):
+            arrival = ""
+        return str(arrival).strip()
+
+    df["_truck_key"] = df.apply(_key, axis=1)
+    return df
+
+
+# ===== グループ分け（上から順に積む: ファーストフィット） =====
+def _normalize_hinban_text(value) -> str:
+    return str(value).strip()
+
+
+def assign_groups_sequential(heights: pd.Series, cap: float, max_pallets: Optional[int] = None) -> list:
+    """グループを連続割当（ファーストフィット）。
+
+    Args:
+        heights: 高さのSeries
+        cap: 高さ上限
+        max_pallets: 1山最大パレット数。Noneなら高さのみで判定（従来動作）。
+
+    Returns:
+        グループ番号のリスト
+    """
+    cur_g, cur_h = 1, 0.0
+    cur_pallet_count = 0  # 現在の山のパレット数
+    out = []
+    heights_list = heights.astype(float).to_list()
+
+    for h in heights_list:
+        # 判定: 高さ制約 AND パレット数制約
+        height_ok = cur_h + h <= cap
+        pallet_ok = max_pallets is None or cur_pallet_count < max_pallets
+
+        if height_ok and pallet_ok:
+            # 現在の山に追加
+            out.append(cur_g)
+            cur_h += h
+            cur_pallet_count += 1
+        else:
+            # 新しい山を開始
+            cur_g += 1
+            cur_h = h
+            cur_pallet_count = 1
+            out.append(cur_g)
+    return out
+
+
+def _size1_local_group_cols(size1_df: pd.DataFrame) -> list:
+    """サイズ1/21のローカル山（便内高さ積み・混載ユニット化）を集約するキー列。
+
+    Issue #135 Step2: NONYUHIBIN（便番号）は納入先ごとに独立に採番されているため、
+    異なる納入先が同一便番号を共有するケースがあり、そのままではローカル山の中で
+    納入先が混在してしまう（プール跨ぎ。Issue #135実測: 89件、ユニーク便ベースで
+    86/143便=60.1%）。「納入先」を追加キーとし、同一便番号内でも納入先が異なれば
+    別のローカル山として積む。NONYUHIBIN自体は _match_units_with_layer_rules の
+    便違い混載禁止判定（KVC/元町の入車時間一致例外を含む）で使うため維持する。
+    """
+    cols = ["NONYUHIBIN", "納入先", "_role_class"]
+    if "納入先コード" in size1_df.columns:
+        idx = cols.index("_role_class")
+        cols.insert(idx, "納入先コード")
+    # 要件 R2: エリア・列もキーにして、場所をまたいでローカル山を積まない
+    # （例: 高岡05便の C15-A-3 と L12-C-5、日野02便の Q10-A と Q10-B は別のローカル山）。
+    for c in ("_area", "_row"):
+        if c in size1_df.columns:
+            cols.append(c)
+    return cols
+
+
+def _sort_for_local_stack(df: pd.DataFrame) -> pd.DataFrame:
+    """ローカル山に積む順番を決める（要件 R3）。
+
+    受入（UKEIRE）ごとにまとめて積み、受入の中は移動工数の大きい順。
+    受入どうしは「その受入の最大移動工数」が大きい順に並べるので、受入が1種類なら従来と同じ順になる。
+    UKEIRE 列が無いときは従来どおり移動工数の大きい順だけ。
+    """
+    if df.empty or "UKEIRE" not in df.columns:
+        return df.sort_values(by=["移動工数"], ascending=[False]).copy()
+    work = df.copy()
+    work["_uk"] = work["UKEIRE"].astype(str).str.strip()
+    work["_uk_max"] = pd.to_numeric(work["移動工数"], errors="coerce").groupby(work["_uk"]).transform("max")
+    work = work.sort_values(by=["_uk_max", "_uk", "移動工数"], ascending=[False, True, False])
+    return work.drop(columns=["_uk", "_uk_max"])
+
+
+def _build_size1_stack_units(size1_packed: pd.DataFrame, mixing_key: str) -> pd.DataFrame:
+    """サイズ1/21のローカル山から、混載判定用ユニット表を生成する。"""
+    if "_aisle" not in size1_packed.columns:
+        size1_packed = _add_aisle_column(size1_packed.copy())
+    group_cols = _size1_local_group_cols(size1_packed) + ["ローカルグループ番号"]
+
+    aggs = {
+        "高さ合計": ("高さ", "sum"),
+        "Max移動工数": ("移動工数", "max"),
+        "_has_size1": ("_is_size1", "any"),
+        "_has_size21": ("_is_size21", "any"),
+        "_has_special_hinban": ("_has_special_hinban", "any"),
+        "_truck_key": ("_truck_key", "first"),
+        "_aisle_set": ("_aisle", _aisle_set),  # Issue #146
+    }
+    if mixing_key in size1_packed.columns:
+        aggs[mixing_key] = (mixing_key, "first")
+    # 「納入先」は group_cols（groupbyキー）に含まれるため、aggsには入れない
+    if "入車時間" in size1_packed.columns:
+        aggs["入車時間"] = ("入車時間", "first")
+    if "UKEIRE" in size1_packed.columns:
+        aggs["UKEIRE"] = ("UKEIRE", "first")
+
+    units = size1_packed.groupby(group_cols).agg(**aggs).reset_index()
+    if units.empty:
+        units["山ID"] = pd.Series(dtype=int)
+        return units
+
+    units["_has_size1"] = units["_has_size1"].astype(bool)
+    units["_has_size21"] = units["_has_size21"].astype(bool)
+    units["_has_special_hinban"] = units["_has_special_hinban"].astype(bool)
+    units["山ID"] = np.arange(1, len(units) + 1)
+    return units
+
+
+def _match_units_with_layer_rules_single_pass(
+    units: pd.DataFrame, height_cap: float, require_aisle_match: bool = False
+) -> dict:
+    """層役割と既存条件で2山/3山混載を判定し、山IDの代表マップを返す（1回きりのマッチング）。
+
+    require_aisle_match=True の場合、Issue #146のアイル（ストア先頭1文字）優先ルールを適用する。
+    双方にアイル情報がある場合のみ一致を必須とし、いずれかのアイルが不明な場合は
+    従来ルール（高さフィット優先）にフォールバックする。
+    """
+    if units is None or units.empty:
+        return {}
+
+    if "_truck_key" not in units.columns:
+        units = _add_truck_key_column(units.copy())
+    if "_aisle_set" not in units.columns:
+        units = units.copy()
+        units["_aisle_set"] = [frozenset()] * len(units)
+
+    used, id_map = set(), {}
+    all_true = pd.Series(True, index=units.index)
+    special_hinban_mask = units.get("_has_special_hinban", pd.Series(False, index=units.index)).astype(bool)
+    has_time_cols = {"_床秒", "_締切秒"}.issubset(units.columns)
+
+    def _time_feasible(base_floor: float, base_deadline: float, candidates: pd.DataFrame) -> pd.Series:
+        if not has_time_cols:
+            return pd.Series(True, index=candidates.index)
+        merged_floor = np.maximum(candidates["_床秒"].astype(float), float(base_floor))
+        merged_deadline = np.minimum(candidates["_締切秒"].astype(float), float(base_deadline))
+        return pd.Series(merged_floor <= merged_deadline, index=candidates.index)
+    def _aisle_compatible(base_aisles, candidates: pd.DataFrame) -> pd.Series:
+        """Issue #146: アイル一致を優先するが必須ではない（フォールバックあり）。"""
+        if not require_aisle_match or not base_aisles:
+            return pd.Series(True, index=candidates.index)
+        cand_sets = candidates["_aisle_set"]
+        return cand_sets.map(lambda s: True if not s else bool(base_aisles & s))
+    def _cap_for_merge(base_has_special: bool, candidates: pd.DataFrame, normal_cap: float):
+        """統合対象(g1やg1+g2)または候補が特例品番を含むならSPECIAL_HINBAN_HEIGHT_CAP、それ以外は通常capを返す（候補ごとのSeries）。"""
+        combined = candidates.get("_has_special_hinban", pd.Series(False, index=candidates.index)).astype(bool) | bool(base_has_special)
+        return np.where(combined, float(SPECIAL_HINBAN_HEIGHT_CAP), float(normal_cap))
+
+    def _cross_role_allowed(base_row: pd.Series, candidate_units: pd.DataFrame) -> pd.Series:
+        """base_row と candidate_units のペアが 1×21 のクロス統合として許可されるかを返す。"""
+        base_has1 = bool(base_row.get("_has_size1", False))
+        base_has21 = bool(base_row.get("_has_size21", False))
+        base_vendor = str(base_row.get("納入先", "")).strip()
+        base_bin = str(base_row.get("NONYUHIBIN", "")).strip()
+        units_vendor = candidate_units["納入先"].astype(str).str.strip()
+        units_bin = candidate_units["NONYUHIBIN"].astype(str).str.strip()
+
+        cross = ((base_has1 & candidate_units["_has_size21"]) | (base_has21 & candidate_units["_has_size1"]))
+        hino_both = units_vendor.str.startswith(HINO_VENDOR_PREFIX) & base_vendor.startswith(HINO_VENDOR_PREFIX)
+        same_vendor_same_bin = units_vendor.eq(base_vendor) & units_bin.eq(base_bin)
+        return (~cross) | (~hino_both) | same_vendor_same_bin
+
+    def _forbidden_same_vendor_diff_bin(base_row: pd.Series) -> pd.Series:
+        base_vendor = str(base_row.get("納入先", "")).strip()
+        base_truck_key = base_row.get("_truck_key")
+        same_vendor = units["納入先"].astype(str).str.strip().eq(base_vendor)
+        diff_truck = units["_truck_key"].map(lambda truck_key: truck_key != base_truck_key)
+        return same_vendor & diff_truck
+
+    for _, g1 in units.sort_values("高さ合計", ascending=False).iterrows():
+        id1 = int(g1["山ID"])
+        if id1 in used:
+            continue
+
+        has21_g1 = bool(g1.get("_has_size21", False))
+        has1_g1 = bool(g1.get("_has_size1", False))
+        has_special_g1 = bool(g1.get("_has_special_hinban", False))
+        margin2 = _cap_for_merge(has_special_g1, units, height_cap) - float(g1["高さ合計"])
+        cond_same_dest_diff_bin = _forbidden_same_vendor_diff_bin(g1)
+        cond_mix2 = ~cond_same_dest_diff_bin
+
+        cond_layer2 = _cross_role_allowed(g1, units)
+        if has21_g1:
+            # 維持ルール: 特例品番631426010000はsize21山に載せない
+            cond_layer2 &= ~special_hinban_mask
+        if has_special_g1:
+            # 維持ルール: 特例品番入り山にsize21を載せない
+            cond_layer2 &= ~units["_has_size21"]
+        g1_floor = float(g1["_床秒"]) if has_time_cols else 0.0
+        g1_deadline = float(g1["_締切秒"]) if has_time_cols else float("inf")
+        cond_aisle2 = _aisle_compatible(g1.get("_aisle_set", frozenset()), units)
+        cond_mix2_final = cond_mix2 & cond_layer2 & cond_aisle2 & _time_feasible(g1_floor, g1_deadline, units)
+
+        cand2 = units[
+            (~units["山ID"].isin(used))
+            & (units["山ID"] != id1)
+            & cond_mix2_final
+            & (units["高さ合計"] <= margin2)
+        ].sort_values("高さ合計", ascending=False)
+
+        if _trace_on():
+            _avail = (~units["山ID"].isin(used)) & (units["山ID"] != id1)
+            _over = pd.Series(
+                np.asarray(units["高さ合計"], dtype=float) > np.asarray(margin2, dtype=float),
+                index=units.index,
+            )
+            _blank = pd.Series("", index=units.index)
+            _tbl = pd.DataFrame({
+                "山ID": units["山ID"],
+                "納入先": units["納入先"].astype(str),
+                "便": units["NONYUHIBIN"].astype(str),
+                "入車": units.get("入車時間", _blank).astype(str),
+                "役割": units.get("_role_class", _blank).astype(str),
+                "高さ合計": units["高さ合計"],
+                "Max移動工数": units.get("Max移動工数", pd.Series(np.nan, index=units.index)),
+                "×禁止": cond_same_dest_diff_bin,
+                "×層": ~cond_layer2,
+                "×時間": ~_time_feasible(g1_floor, g1_deadline, units),
+                "×高さ": _over,
+            }).loc[_avail]
+            logger.debug(
+                "TRACE#135 g1=%d 納入先=%s 便=%s 入車=%s 役割=%s 高さ合計=%.1f Max移動工数=%s "
+                "特例=%s 余裕(通常cap)=%.1f 候補数=%d\n%s",
+                id1, str(g1.get("納入先", "")), str(g1.get("NONYUHIBIN", "")),
+                str(g1.get("入車時間", "")), str(g1.get("_role_class", "")),
+                float(g1["高さ合計"]), g1.get("Max移動工数"), bool(has_special_g1),
+                float(height_cap) - float(g1["高さ合計"]), int(len(cand2)),
+                _tbl.to_string(index=False),
+            )
+
+        if cand2.empty:
+            if _trace_on():
+                logger.debug(
+                    "TRACE#135 g1=%d → 相手なし・単独山（納入先=%s 便=%s 高さ合計=%.1f）",
+                    id1, str(g1.get("納入先", "")), str(g1.get("NONYUHIBIN", "")),
+                    float(g1["高さ合計"]),
+                )
+            continue
+
+        g2 = cand2.iloc[0]
+        id2 = int(g2["山ID"])
+        if _trace_on():
+            logger.debug(
+                "TRACE#135   ├ g2採用=%d 納入先=%s 便=%s 高さ合計=%.1f Max移動工数=%s",
+                id2, str(g2.get("納入先", "")), str(g2.get("NONYUHIBIN", "")),
+                float(g2["高さ合計"]), g2.get("Max移動工数"),
+            )
+
+        # 【特例品番フィルタ：層3用】g1 + g2 の統合フラグで判定
+        has21_g1 = bool(g1.get("_has_size21", False))
+        has21_g2 = bool(g2.get("_has_size21", False))
+        has21_merged = has21_g1 | has21_g2
+        
+        has_special_g1 = bool(g1.get("_has_special_hinban", False))
+        has_special_g2 = bool(g2.get("_has_special_hinban", False))
+        has_special_merged = has_special_g1 | has_special_g2
+
+        margin3 = _cap_for_merge(has_special_merged, units, height_cap) - float(g1["高さ合計"]) - float(g2["高さ合計"])
+        cond_mix3_1 = ~_forbidden_same_vendor_diff_bin(g1)
+        cond_mix3_2 = ~_forbidden_same_vendor_diff_bin(g2)
+
+        cond_layer3 = _cross_role_allowed(g1, units) & _cross_role_allowed(g2, units)
+        if has21_merged:
+            cond_layer3 &= ~special_hinban_mask
+        if has_special_merged:
+            cond_layer3 &= ~units["_has_size21"]
+        g2_floor = float(g2["_床秒"]) if has_time_cols else 0.0
+        g2_deadline = float(g2["_締切秒"]) if has_time_cols else float("inf")
+        base_aisles_12 = (
+            (g1.get("_aisle_set", frozenset()) or frozenset())
+            | (g2.get("_aisle_set", frozenset()) or frozenset())
+        )
+        cond_aisle3 = _aisle_compatible(base_aisles_12, units)
+        cond_mix3_final = (
+            cond_mix3_1 & cond_mix3_2 & cond_layer3 & cond_aisle3
+            & _time_feasible(max(g1_floor, g2_floor), min(g1_deadline, g2_deadline), units)
+        )
+
+        cand3 = units[
+            (~units["山ID"].isin(used))
+            & (~units["山ID"].isin([id1, id2]))
+            & cond_mix3_final
+            & (units["高さ合計"] <= margin3)
+        ].sort_values("高さ合計", ascending=False)
+
+        if _trace_on():
+            if cand3.empty:
+                logger.debug("TRACE#135   └ g3なし（余裕(通常cap)=%.1f）",
+                             float(height_cap) - float(g1["高さ合計"]) - float(g2["高さ合計"]))
+            else:
+                _g3 = cand3.iloc[0]
+                logger.debug("TRACE#135   └ g3採用=%d 納入先=%s 便=%s 高さ合計=%.1f",
+                             int(_g3["山ID"]), str(_g3.get("納入先", "")),
+                             str(_g3.get("NONYUHIBIN", "")), float(_g3["高さ合計"]))
+
+        used.update({id1, id2})
+        id_map[id2] = id1
+        if not cand3.empty:
+            id3 = int(cand3.iloc[0]["山ID"])
+            used.add(id3)
+            id_map[id3] = id1
+
+    return id_map
+
+
+def _match_units_with_layer_rules(units: pd.DataFrame, height_cap: float) -> dict:
+    """1巡目はアイル一致必須でマッチングし、残りを2巡目で従来ルール（アイル制約なし）にて
+    マッチングする2スイープ方式のラッパー（Issue #135 Step3 / Issue #146）。"""
+    id_map_1 = _match_units_with_layer_rules_single_pass(units, height_cap, require_aisle_match=True)
+
+    if units is None or units.empty:
+        return id_map_1
+
+    all_ids = set(units["山ID"].astype(int))
+    matched_ids = set(id_map_1.keys()) | set(id_map_1.values())
+    leftover_ids = all_ids - matched_ids
+
+    if len(leftover_ids) < 2:
+        return id_map_1
+
+    leftover_units = units[units["山ID"].astype(int).isin(leftover_ids)]
+    id_map_2 = _match_units_with_layer_rules_single_pass(leftover_units, height_cap, require_aisle_match=False)
+
+    assert not (set(id_map_1.keys()) & set(id_map_2.keys())), (
+        "2周目のid_mapが1周目とキー重複しています（想定外）"
+    )
+    if id_map_2 and _trace_on():
+        logger.debug("TRACE#135 2周目マージ発生: %s", id_map_2)
+
+    return {**id_map_1, **id_map_2}
+
+
+# ===== メインパイプライン =====
+def run_pipeline(
+    data_manager,
+    selections,
+    height_cap,
+    mixing_key,
+    master_df=None,
+    previous_lane_end_times: Optional[Dict[str, int]] = None,
+    return_lane_end_times: bool = False,
+):
+    """
+    仕分けパイプライン: フィルタリング→展開→グループ化→混載
+    data_manager: DataManagerインスタンス
+    """
+    filtered = data_manager.filter_shipments(selections)
+
+    # パレット単位に展開
+    if filtered.empty:
+        expanded = filtered.copy()
+    else:
+        counts = filtered["PLANKANBANSU"].where(filtered["PLANKANBANSU"] >= 1, 1)
+        idx = np.repeat(filtered.index.to_numpy(), counts.to_numpy())
+        expanded = filtered.loc[idx].reset_index(drop=True)
+
+    # 入車時間列を付与
+    expanded = _add_arrival_time_column(expanded, master_df)
+    expanded = _add_truck_key_column(expanded)
+    target_mask_expanded = _target_takaoka_mask(expanded)
+    if target_mask_expanded.any():
+        arrivals = sorted(expanded.loc[target_mask_expanded, "入車時間"].astype(str).unique().tolist()) if "入車時間" in expanded.columns else []
+        sizes = sorted(expanded.loc[target_mask_expanded, "サイズ種類"].astype(str).unique().tolist()) if "サイズ種類" in expanded.columns else []
+        logger.debug(
+            "DEBUG 高岡2026062503/K5: _add_arrival_time_column後 入車時間=%s サイズ種類=%s 件数=%d",
+            arrivals,
+            sizes,
+            int(target_mask_expanded.sum()),
+        )
+
+    # 基本グループ（全サイズ種類）
+    group_results, group_details = {}, {}
+    if not expanded.empty:
+        for size_type in expanded["サイズ種類"].astype(str).unique():
+            df_sub = expanded.loc[expanded["サイズ種類"].astype(str) == str(size_type)].copy()
+            sort_cols = (["移動工数", "NONYUHIBIN"] if str(size_type) == "4"
+                         else ["移動工数", "SYUKKASAKI"])
+            sort_asc = ([False, True] if str(size_type) == "4"
+                        else [False, True])
+            df_sorted = df_sub.sort_values(by=sort_cols, ascending=sort_asc).copy()
+
+            has_arrival = "入車時間" in df_sorted.columns and df_sorted["入車時間"].ne("").any()
+            if _trace_on() and has_arrival:
+                _t = df_sorted.copy()
+                _t["_納入日"] = _t["NONYUHIBIN"].astype(str).str.strip().str[:8]
+                _agg = {"件数": ("高さ", "size"),
+                        "納入日数": ("_納入日", "nunique"),
+                        "納入日一覧": ("_納入日", _join_uniq),
+                        "便一覧": ("NONYUHIBIN", _join_uniq)}
+                if "納入先" in _t.columns:
+                    _agg["納入先一覧"] = ("納入先", _join_uniq)
+                logger.debug(
+                    "TRACE#135 基本グループ サイズ%s の入車時間プール（納入日数>1 なら日跨ぎ混在）\n%s",
+                    size_type,
+                    _t.groupby("入車時間", sort=True).agg(**_agg).to_string(),
+                )
+            if has_arrival:
+                group_numbers = pd.Series(0, index=df_sorted.index, dtype=int)
+                base_group = 0
+                for _, part in df_sorted.groupby("入車時間", sort=True):
+                    target_mask_part = _target_takaoka_mask(part)
+                    if target_mask_part.any():
+                        hsum = pd.to_numeric(part.loc[target_mask_part, "高さ"], errors="coerce").fillna(0).sum() if "高さ" in part.columns else 0.0
+                    if str(size_type) == "1":
+                        part_groups = assign_groups_sequential(part["高さ"], cap=height_cap)
+                    elif str(size_type) == SIZE5_TYPE:
+                        part_groups = assign_groups_sequential(part["高さ"], cap=height_cap, max_pallets=SIZE5_MAX_PALLETS_PER_YAMA)
+                    elif str(size_type) == SIZE17_TYPE:
+                       # サイズ17は全出荷先で高さ2500まで積載可（最大3パレット）。2026/06 Kawasaki氏確認。
+                       # 初回積み付けから2500で積み、2450で不要に山を割らないようにする。
+                       part_groups = assign_groups_sequential(part["高さ"], cap=SIZE17_MERGE_HEIGHT_CAP)
+                    else:
+                        part_groups = assign_groups_sequential(part["高さ"], cap=height_cap)
+                    group_numbers.loc[part.index] = [g + base_group for g in part_groups]
+                    if part_groups:
+                        base_group += max(part_groups)
+                df_sorted["グループ番号"] = group_numbers.astype(int)
+            else:
+                if str(size_type) == "1":
+                    df_sorted["グループ番号"] = assign_groups_sequential(
+                        df_sorted["高さ"], cap=height_cap
+                    )
+                elif str(size_type) == SIZE5_TYPE:
+                    df_sorted["グループ番号"] = assign_groups_sequential(
+                        df_sorted["高さ"], cap=height_cap, max_pallets=SIZE5_MAX_PALLETS_PER_YAMA
+                    )
+                else:
+                    df_sorted["グループ番号"] = assign_groups_sequential(df_sorted["高さ"], cap=height_cap)
+
+            grp = df_sorted.groupby("グループ番号").agg(
+                パレット数=("グループ番号", "count"),
+                Max移動工数=("移動工数", "max"),
+            ).reset_index()
+            grp["引取工数"] = np.round(
+                grp["Max移動工数"] + BASE_ONE_TIME + ((grp["パレット数"] - 1) * MIDDLE_WORK) + (grp["パレット数"] * BASE_PER_PAL), 0
+            ).astype(int)
+            group_results[str(size_type)] = grp
+            group_details[str(size_type)] = df_sorted
+
+    # 種類1/21の混載
+    size1_mixed_summary, size1_mixed_details = None, None
+    if not expanded.empty and expanded["サイズ種類"].astype(str).str.strip().isin(["1", "21"]).any():
+        size1_mixed_summary, size1_mixed_details = _build_size1_mixed(
+            expanded, height_cap, mixing_key, master_df
+        )
+
+    lane_end_times = dict(previous_lane_end_times or {})
+    if return_lane_end_times:
+        return (
+            filtered,
+            expanded,
+            group_results,
+            group_details,
+            size1_mixed_summary,
+            size1_mixed_details,
+            lane_end_times,
+        )
+
+    return filtered, expanded, group_results, group_details, size1_mixed_summary, size1_mixed_details
+
+# ===== 山組みの6段階まとめ（docs/要件_山組みエリア列集約.md R4〜R6） =====
+# 1山に混ぜる便の上限 MAX_BINS_PER_YAMA（R5。None = 上限なし）は src/models/constants.py で定義している
+
+# R4 の6段階: (段階名, 同じ列が必須, 同じエリアが必須, 同じトラックが必須)
+_STAGED_MATCH_SCOPES = (
+    ("同じ列×同じトラック", True, False, True),
+    ("同じ列", True, False, False),
+    ("同じエリア×同じトラック", False, True, True),
+    ("同じエリア", False, True, False),
+    ("同じトラック", False, False, True),
+    ("制限なし", False, False, False),
+)
+
+
+def _to_float(value, default: float) -> float:
+    """数値にできない値・欠損は default にする。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    return default if pd.isna(f) else f
+
+
+def _to_key_str(value) -> str:
+    """キー用の文字列にする（欠損は空文字）。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value).strip()
+
+
+class _StagedYama:
+    """6段階まとめの途中の山（ローカル山の集まり）。"""
+
+    def __init__(self, unit: dict):
+        self.id = unit["id"]  # 代表のローカル山ID（同じ高さ・同じ工数のときの「元の順」）
+        self.members = [unit]
+        self.height = unit["height"]
+        self.move = unit["move"]
+        self.special = unit["special"]
+        self.has21 = unit["has21"]
+        self.rows = {unit["row"]}
+        self.areas = {unit["area"]}
+        self.trucks = {unit["truck"]}
+        self.bins = {unit["bin"]}
+        self.vendor_trucks = {unit["vendor"]: {unit["truck"]}}
+        self.floor = unit["floor"]
+        self.deadline = unit["deadline"]
+
+    def absorb(self, other: "_StagedYama") -> None:
+        self.members.extend(other.members)
+        self.height += other.height
+        self.move = max(self.move, other.move)
+        self.special = self.special or other.special
+        self.has21 = self.has21 or other.has21
+        self.rows |= other.rows
+        self.areas |= other.areas
+        self.trucks |= other.trucks
+        self.bins |= other.bins
+        for vendor, trucks in other.vendor_trucks.items():
+            self.vendor_trucks.setdefault(vendor, set()).update(trucks)
+        self.floor = max(self.floor, other.floor)
+        self.deadline = min(self.deadline, other.deadline)
+
+    def clone(self) -> "_StagedYama":
+        """探索の巻き戻し用のコピー（members の中身は共有し、集合・辞書はコピーする）。"""
+        c = _StagedYama.__new__(_StagedYama)
+        c.id = self.id
+        c.members = list(self.members)
+        c.height = self.height
+        c.move = self.move
+        c.special = self.special
+        c.has21 = self.has21
+        c.rows = set(self.rows)
+        c.areas = set(self.areas)
+        c.trucks = set(self.trucks)
+        c.bins = set(self.bins)
+        c.vendor_trucks = {v: set(t) for v, t in self.vendor_trucks.items()}
+        c.floor = self.floor
+        c.deadline = self.deadline
+        return c
+
+    def sort_key(self) -> tuple:
+        """高い順 → 移動工数の大きい順 → 元の順（R4）。"""
+        return (-self.height, -self.move, self.id)
+
+
+def _staged_unit_records(units: pd.DataFrame) -> list:
+    """ローカル山の表を、6段階まとめ用の dict のリストにする。"""
+    has_time = {"_床秒", "_締切秒"}.issubset(units.columns)
+    records = []
+    for _, u in units.iterrows():
+        vendor = _to_key_str(u.get("納入先"))
+        nony = _to_key_str(u.get("NONYUHIBIN"))
+        records.append({
+            "id": int(u["山ID"]),
+            "height": _to_float(u.get("高さ合計"), 0.0),
+            "move": _to_float(u.get("Max移動工数"), float("-inf")),
+            "has1": bool(u.get("_has_size1", False)),
+            "has21": bool(u.get("_has_size21", False)),
+            "special": bool(u.get("_has_special_hinban", False)),
+            "vendor": vendor,
+            "nony": nony,
+            "bin": (vendor, nony[-2:]),
+            "truck": _to_key_str(u.get("_truck_key")),
+            "area": _to_key_str(u.get("_area")) or UNKNOWN_STORE_AREA,
+            "row": _to_key_str(u.get("_row")) or UNKNOWN_STORE_AREA,
+            "floor": _to_float(u.get("_床秒"), 0.0) if has_time else 0.0,
+            "deadline": _to_float(u.get("_締切秒"), float("inf")) if has_time else float("inf"),
+        })
+    return records
+
+
+def _single_known(values: set) -> bool:
+    """列・エリアが1つだけで、「不明」でもない（R1: 不明は段階5・6でだけ混ぜる）。"""
+    return len(values) == 1 and UNKNOWN_STORE_AREA not in values
+
+
+def _hino_cross_ok(a: dict, b: dict) -> bool:
+    """日野どうしの 1×21 は、同じ納入先・同じ便だけ（_cross_role_allowed と同じ判定）。"""
+    cross = (a["has1"] and b["has21"]) or (a["has21"] and b["has1"])
+    if not cross:
+        return True
+    if not (a["vendor"].startswith(HINO_VENDOR_PREFIX) and b["vendor"].startswith(HINO_VENDOR_PREFIX)):
+        return True
+    return a["vendor"] == b["vendor"] and a["nony"] == b["nony"]
+
+
+def _can_merge_staged(base, cand, height_cap: float, need_row: bool, need_area: bool, need_truck: bool) -> bool:
+    """base に cand を足せるか（R4 の段階の範囲 + R5 + R6）。"""
+    # R4: この段階でまとめてよい範囲か
+    if need_row and not _single_known(base.rows | cand.rows):
+        return False
+    if need_area and not _single_known(base.areas | cand.areas):
+        return False
+    if need_truck and len(base.trucks | cand.trucks) != 1:
+        return False
+    # R5: 便の数の上限（None = 上限なし）
+    if MAX_BINS_PER_YAMA is not None and len(base.bins | cand.bins) > MAX_BINS_PER_YAMA:
+        return False
+    # R6: 高さ（特例品番を含めば2500、それ以外は height_cap）
+    special = base.special or cand.special
+    cap = float(SPECIAL_HINBAN_HEIGHT_CAP) if special else float(height_cap)
+    if base.height + cand.height > cap:
+        return False
+    # R6: 特例品番と21は混ぜない
+    if special and (base.has21 or cand.has21):
+        return False
+    # R6: 同じ納入先で入車時間（トラック）が違う便は混ぜない
+    for vendor, trucks in cand.vendor_trucks.items():
+        if vendor in base.vendor_trucks and len(base.vendor_trucks[vendor] | trucks) > 1:
+            return False
+    # R6: 開始下限（床）≦ 締切
+    if max(base.floor, cand.floor) > min(base.deadline, cand.deadline):
+        return False
+    # R6: 日野どうしの1×21は同じ納入先・同じ便だけ
+    return all(_hino_cross_ok(a, b) for a in base.members for b in cand.members)
+
+
+def _match_units_staged(units: pd.DataFrame, height_cap: float) -> dict:
+    """ローカル山を6段階でまとめる（要件 R4〜R6）。
+
+    段階ごとに、高い山から順に「条件を満たして入る相手のうち一番高い山」を足し、
+    足せなくなるまで繰り返す（同じ高さなら移動工数の大きい方 → 元の順）。
+    前の段階で組んだ山は崩さない。
+    戻り値は _match_units_with_layer_rules と同じ {ローカル山ID: 代表のローカル山ID}。
+    旧 _match_units_with_layer_rules は、R7（安全弁）の比較用と既存テストのために残す。
+    """
+    if units is None or units.empty:
+        return {}
+    yamas = {r["id"]: _StagedYama(r) for r in _staged_unit_records(units)}
+    for _label, need_row, need_area, need_truck in _STAGED_MATCH_SCOPES:
+        for base_id in [y.id for y in sorted(yamas.values(), key=_StagedYama.sort_key)]:
+            base = yamas.get(base_id)
+            if base is None:  # この段階で、すでに他の山に入った
+                continue
+            while True:
+                partner = next(
+                    (
+                        c for c in sorted(yamas.values(), key=_StagedYama.sort_key)
+                        if c.id != base.id
+                        and _can_merge_staged(base, c, height_cap, need_row, need_area, need_truck)
+                    ),
+                    None,
+                )
+                if partner is None:
+                    break
+                base.absorb(partner)
+                del yamas[partner.id]
+    return {m["id"]: y.id for y in yamas.values() for m in y.members if m["id"] != y.id}
+
+# ===== 要件 R10: トラックごとに、パレット1枚単位で山を組み直して山の数を減らす =====
+class _RefillBudgetExceeded(Exception):
+    """組み直しの探索が、上限回数に達した。"""
+
+
+def _staged_pallet_record(pos: int, r) -> dict:
+    """パレット1枚を、6段階まとめ用の dict にする（_staged_unit_records と同じキー）。"""
+    vendor = _to_key_str(r.get("納入先"))
+    nony = _to_key_str(r.get("NONYUHIBIN"))
+    return {
+        "id": pos,
+        "height": _to_float(r.get("高さ"), 0.0),
+        "move": _to_float(r.get("移動工数"), float("-inf")),
+        "has1": bool(r.get("_is_size1", False)),
+        "has21": bool(r.get("_is_size21", False)),
+        "special": bool(r.get("_has_special_hinban", False)),
+        "vendor": vendor,
+        "nony": nony,
+        "bin": (vendor, nony[-2:]),
+        "truck": _to_key_str(r.get("_truck_key")),
+        "area": _to_key_str(r.get("_area")) or UNKNOWN_STORE_AREA,
+        "row": _to_key_str(r.get("_row")) or UNKNOWN_STORE_AREA,
+        "floor": _to_float(r.get("_床秒"), 0.0),
+        "deadline": _to_float(r.get("_締切秒"), float("inf")),
+    }
+
+
+def _refill_signature(g) -> tuple:
+    """探索で「同じ状態の山」を見分ける印。同じ印の山は、どちらに足しても結果が同じなので片方だけ試す。"""
+    return (
+        round(g.height, 6), g.special, g.has21,
+        frozenset(g.bins), frozenset(g.rows), frozenset(g.areas),
+        g.floor, g.deadline,
+        frozenset((m["vendor"], m["nony"], m["has1"], m["has21"]) for m in g.members),
+    )
+
+
+def _shares_known(a: set, b: set) -> bool:
+    """列・エリアが共通か（「不明」どうしは共通とみなさない）。"""
+    return bool((a & b) - {UNKNOWN_STORE_AREA})
+
+
+def _refill_search(pallets: list, target: int, height_cap: float, max_nodes: int):
+    """パレット（1枚ずつの _StagedYama）を target 山以内に分けられれば、山ごとの添字のリストを返す。無ければ None。
+
+    高いパレットから順に「既存の山に足す」か「新しい山を作る」を深さ優先で試す。
+    足せるかは _can_merge_staged（R4〜R6 と同じ判定）で決める。
+    試す回数が max_nodes を超えたら _RefillBudgetExceeded を投げる。
+    """
+    order = sorted(
+        range(len(pallets)),
+        key=lambda i: (-pallets[i].height, -pallets[i].move, pallets[i].id),
+    )
+    groups: list = []  # [(山, [パレットの添字, ...]), ...]
+    nodes = 0
+    def place(k: int) -> bool:
+        nonlocal nodes
+        if k == len(order):
+            return True
+        nodes += 1
+        if nodes > max_nodes:
+            raise _RefillBudgetExceeded()
+        i = order[k]
+        p = pallets[i]
+        options = [
+            gi for gi, (g, _members) in enumerate(groups)
+            if _can_merge_staged(g, p, height_cap, False, False, True)
+        ]
+        # 同じ列 → 同じエリア → 高い山（隙間が小さい山）の順に試す
+        options.sort(key=lambda gi: (
+            0 if _shares_known(p.rows, groups[gi][0].rows) else 1,
+            0 if _shares_known(p.areas, groups[gi][0].areas) else 1,
+            -groups[gi][0].height,
+            gi,
+        ))
+        tried = set()
+        for gi in options:
+            g, members = groups[gi]
+            sig = _refill_signature(g)
+            if sig in tried:
+                continue
+            tried.add(sig)
+            merged = g.clone()
+            merged.absorb(p)
+            groups[gi] = (merged, members + [i])
+            if place(k + 1):
+                return True
+            groups[gi] = (g, members)
+        if len(groups) < target:
+            groups.append((p.clone(), [i]))
+            if place(k + 1):
+                return True
+            groups.pop()
+        return False
+
+    if place(0):
+        return [members for _g, members in groups]
+    return None
+
+
+def _refill_cost(groups: list, orig_of: list) -> tuple:
+    """組み方の点数（小さいほど良い）。
+    1) 各山に入っている「6段階の山」の数の合計（6段階のまとまり＝列ごとのローカル山を崩すほど増える）
+    2) 各山の列の数の合計（列をまたぐほど増える）
+    """
+    rows = sum(len(g.rows) for g, _m in groups)
+    origs = sum(len({orig_of[i] for i in m}) for _g, m in groups)
+    return (origs, rows)
+
+
+def _build_refill_groups(pallets: list, layout: list) -> list:
+    """山ごとの添字のリストから、(山, 添字のリスト) の組を作る。"""
+    groups = []
+    for members in layout:
+        g = pallets[members[0]].clone()
+        for i in members[1:]:
+            g.absorb(pallets[i])
+        groups.append((g, list(members)))
+    return groups
+
+
+def _refill_best_layout(pallets: list, target: int, height_cap: float, max_nodes: int,
+                        orig_of: list, initial: list) -> list:
+    """target 山の組み方のうち、列のまとまりが最も良い（_refill_cost が最小の）ものを返す。
+
+    initial は _refill_search で見つけた組み方。これより良いものだけを採る。
+    探索が max_nodes 回に達したら、そこまでで最も良かった組み方を返す。
+    """
+    order = sorted(
+        range(len(pallets)),
+        key=lambda i: (-pallets[i].height, -pallets[i].move, pallets[i].id),
+    )
+    best = {
+        "cost": _refill_cost(_build_refill_groups(pallets, initial), orig_of),
+        "layout": [list(m) for m in initial],
+    }
+    groups: list = []
+    nodes = 0
+
+    def place(k: int) -> None:
+        nonlocal nodes
+        if _refill_cost(groups, orig_of) >= best["cost"]:
+            return  # ここから先は、今の最良より良くならない（点数は足すほど増える）
+        if k == len(order):
+            best["cost"] = _refill_cost(groups, orig_of)
+            best["layout"] = [list(m) for _g, m in groups]
+            return
+        nodes += 1
+        if nodes > max_nodes:
+            raise _RefillBudgetExceeded()
+        i = order[k]
+        p = pallets[i]
+        same_row, others = [], []
+        for gi, (g, _m) in enumerate(groups):
+            if _can_merge_staged(g, p, height_cap, False, False, True):
+                (same_row if _shares_known(p.rows, g.rows) else others).append(gi)
+        same_row.sort(key=lambda gi: (-groups[gi][0].height, gi))
+        others.sort(key=lambda gi: (
+            0 if _shares_known(p.areas, groups[gi][0].areas) else 1,
+            -groups[gi][0].height, gi,
+        ))
+        tried = set()
+
+        def join(gi: int) -> None:
+            g, members = groups[gi]
+            sig = (_refill_signature(g), frozenset(orig_of[j] for j in members))
+            if sig in tried:
+                return
+            tried.add(sig)
+            merged = g.clone()
+            merged.absorb(p)
+            groups[gi] = (merged, members + [i])
+            place(k + 1)
+            groups[gi] = (g, members)
+
+        # 同じ列の山 → 新しい山 → 別の列の山 の順に試す（良い組み方を早く見つけるため）
+        for gi in same_row:
+            join(gi)
+        if len(groups) < target:
+            groups.append((p.clone(), [i]))
+            place(k + 1)
+            groups.pop()
+        for gi in others:
+            join(gi)
+
+    try:
+        place(0)
+    except _RefillBudgetExceeded:
+        logger.info("[R10] 列のまとまりの探索が上限(%d回)に達したため、ここまでで最も良い組み方を使います", max_nodes)
+    return best["layout"]
+
+
+def _refill_truck(pallets: list, current_count: int, lower_bound: int, height_cap: float,
+                  max_nodes: int, orig_of: list):
+    """山を1つずつ減らせる間、減らして探す。減らせたら、その山の数で列のまとまりが最も良い組み方を返す。
+    減らせなければ None。"""
+    best = None
+    target = current_count - 1
+    while target >= max(lower_bound, 1):
+        try:
+            found = _refill_search(pallets, target, height_cap, max_nodes)
+        except _RefillBudgetExceeded:
+            logger.info("[R10] 探索が上限(%d回)に達したため、ここまでの結果を使います", max_nodes)
+            break
+        if found is None:
+            break
+        best = found
+        target = len(found) - 1
+    if best is None:
+        return None
+    # 山の数が同じ組み方の中から、列のまとまりが最も良いものを選ぶ
+    return _refill_best_layout(pallets, len(best), height_cap, max_nodes, orig_of, best)
+
+
+def _refill_yamas_per_truck(df: pd.DataFrame, height_cap: float) -> pd.DataFrame:
+    """要件 R10: トラック（入車時間）ごとに、パレット1枚単位で山を組み直して、山の数を減らす。
+
+    R4 の6段階は「ローカル山」を丸ごと足すだけなので、列ごとの端数（例: 1,500・1,500・1,250）が
+    丸ごとでは組めず、パレット1枚ずつなら組める、という山が残ることがある。
+    1つのトラックだけで作られた山を対象に、山の数が減るときだけ組み直す。
+    守る条件は _can_merge_staged（R5・R6）と同じ。2つ以上のトラックが混ざった山は触らない。
+    """
+    if df is None or df.empty or "山通番" not in df.columns:
+        return df
+    yama = pd.to_numeric(df["山通番"], errors="coerce").fillna(0).astype(int).to_numpy()
+    records = [_staged_pallet_record(pos, row) for pos, (_, row) in enumerate(df.iterrows())]
+
+    trucks_of_yama: dict = {}
+    for rec, y in zip(records, yama):
+        trucks_of_yama.setdefault(int(y), set()).add(rec["truck"])
+    yamas_of_truck: dict = {}
+    for y, trucks in trucks_of_yama.items():
+        if len(trucks) == 1:  # 1つのトラックだけの山（空の入車時間も1つのトラックとして扱う）
+            yamas_of_truck.setdefault(next(iter(trucks)), []).append(y)
+
+    new_yama = yama.copy()
+    for truck, ys in sorted(yamas_of_truck.items()):
+        if len(ys) < 2:
+            continue
+        ys = sorted(ys)
+        ys_set = set(ys)
+        positions = [pos for pos, y in enumerate(yama) if int(y) in ys_set]
+        pallets = [_StagedYama(records[pos]) for pos in positions]
+        total = sum(p.height for p in pallets)
+        cap_max = (
+            max(float(height_cap), float(SPECIAL_HINBAN_HEIGHT_CAP))
+            if any(p.special for p in pallets) else float(height_cap)
+        )
+        lower_bound = max(1, math.ceil(total / cap_max - 1e-9)) if cap_max > 0 else 1
+        if len(ys) <= lower_bound:
+            continue  # すでに最少
+        found = _refill_truck(
+            pallets, len(ys), lower_bound, float(height_cap), int(REFILL_MAX_SEARCH_NODES),
+            [int(yama[pos]) for pos in positions],  # 各パレットの6段階の山番号
+        )
+        if found is None or len(found) >= len(ys):
+            continue
+        # 山番号は、元の山番号を小さい順に再利用する
+        for yama_id, members in zip(ys, sorted(found, key=min)):
+            for local_idx in members:
+                new_yama[positions[local_idx]] = yama_id
+        logger.info(
+            "[R10] 山の組み直し: 入車%s: %d山 → %d山（パレット%d枚）",
+            truck or "(未設定)", len(ys), len(found), len(positions),
+        )
+
+    if np.array_equal(new_yama, yama):
+        return df
+    out = df.copy()
+    renum = {old: i + 1 for i, old in enumerate(sorted({int(v) for v in new_yama}))}
+    out["山通番"] = [renum[int(v)] for v in new_yama]
+    return out
+
+def _sort_by_move_desc(df: pd.DataFrame) -> pd.DataFrame:
+    """従来（要件 R3 より前）の積む順番: 移動工数の大きい順だけ。R7 の比較用。"""
+    return df.sort_values(by=["移動工数"], ascending=[False]).copy()
+
+
+def _needs_mixed_deadline_rescue(
+    mountain: pd.DataFrame, max_floor: int, min_deadline: Optional[int],
+) -> bool:
+    """他山との競合を除いても、休憩と山全体の工数で締切に間に合わないか。"""
+    if min_deadline is None:
+        return False
+    if max_floor > min_deadline:
+        return True
+    moves = pd.to_numeric(mountain["移動工数"], errors="coerce")
+    max_move = float(moves.max()) if moves.notna().any() else 0.0
+    pallet_count = len(mountain)
+    work_secs = int(np.round(
+        max_move + BASE_ONE_TIME + (pallet_count - 1) * MIDDLE_WORK
+        + pallet_count * BASE_PER_PAL, 0,
+    ))
+    earliest_start = _adjust_start_for_breaks(max_floor, work_secs)
+    earliest_finish = _calc_work_end_with_breaks(earliest_start, work_secs)
+    return earliest_finish > min_deadline
+
+
+def _build_size1_mixed(expanded, height_cap, mixing_key, master_df=None, _legacy=False):
+    """種類1/21の混載処理（1/21以外は対象外）。
+
+    _legacy=True のときは、要件 R1〜R5 を入れる前（main）と同じ組み方をする（R7 の比較用）。
+    通常（False）は新しいまとめ方で組み、最後に R7 の安全弁で従来より R7_YAMA_TOLERANCE 山を超えて増えるときだけ従来へ戻す
+    """
+    stype = expanded["サイズ種類"].astype(str).str.strip()
+    size1_df = expanded.loc[stype.isin(["1", "21"])].copy()
+    if size1_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    stype_sub = size1_df["サイズ種類"].astype(str).str.strip()
+    size1_df["_is_size1"] = stype_sub.eq("1")
+    size1_df["_is_size21"] = stype_sub.eq("21")
+    size1_df["_role_class"] = np.where(size1_df["_is_size21"], "21", "1")
+
+    # SPECIAL_HINBAN (631426010000) フラグを追加
+    hinban_normalized = size1_df.get("HINBAN", pd.Series("", index=size1_df.index)).astype(str).str.strip()
+    size1_df["_has_special_hinban"] = hinban_normalized.eq(_normalize_hinban_text(SPECIAL_HINBAN))
+
+    if "納入先" not in size1_df.columns or not size1_df["納入先"].astype(str).str.strip().ne("").any():
+        # 納入先コード → OData_納入先 → SYUKKASAKI の優先順で補完
+        if "納入先コード" in size1_df.columns and size1_df["納入先コード"].astype(str).str.strip().ne("").any():
+            size1_df["納入先"] = size1_df["納入先コード"].astype(str).str.strip().map(_normalize_dest_name)
+        elif "OData_納入先" in size1_df.columns and size1_df["OData_納入先"].astype(str).str.strip().ne("").any():
+            size1_df["納入先"] = size1_df["OData_納入先"].astype(str).str.strip().map(_normalize_dest_name)
+        elif "SYUKKASAKI" in size1_df.columns:
+            size1_df["納入先"] = size1_df["SYUKKASAKI"].astype(str).str.strip().map(_normalize_dest_name)
+        else:
+            size1_df["納入先"] = ""
+    else:
+        size1_df["納入先"] = size1_df["納入先"].astype(str).str.strip().map(_normalize_dest_name)
+    if "NONYUHIBIN" not in size1_df.columns:
+        size1_df["NONYUHIBIN"] = ""
+    size1_df["NONYUHIBIN"] = size1_df["NONYUHIBIN"].astype(str).str.strip()
+    if "入車時間" not in size1_df.columns:
+        size1_df["入車時間"] = ""
+    size1_df["入車時間"] = size1_df["入車時間"].astype(str).str.strip()
+    if "_truck_key" not in size1_df.columns:
+        size1_df = _add_truck_key_column(size1_df)
+    size1_df = _add_aisle_column(size1_df)  # Issue #146: アイル(ストア先頭1文字)列を付与
+    if not _legacy:
+        size1_df = _add_area_row_columns(size1_df)  # 要件 R1: エリア(_area)・列(_row)を付与
+    # 要件 R3: 受入ごとに積む（従来ロジックは移動工数の大きい順だけ）
+    stack_sort = _sort_by_move_desc if _legacy else _sort_for_local_stack
+
+    # まずは便単位×納入先×層役割（1/21）×エリア×列で高さ積みしてローカル山を作る。
+    # Issue #135 Step2: 「納入先」を追加（詳細は _size1_local_group_cols の docstring）
+    # 要件 R2: 「エリア」「列」を追加
+    local_group_cols = _size1_local_group_cols(size1_df)
+
+    packed_list = []
+    for _, sub in size1_df.groupby(local_group_cols, sort=False):
+        # 特例品番(SPECIAL_HINBAN)行は通常行と分けて別capで積む（山に混在すればcap=2500になるのは後段の統合判定で処理）。
+        # 要件 R3: 受入ごとにまとめ、その中は移動工数の大きい順に積む
+        sub_special = stack_sort(sub[sub["_has_special_hinban"]])
+        sub_normal = stack_sort(sub[~sub["_has_special_hinban"]])
+        base_group = 0
+        parts = []
+        if not sub_special.empty:
+            special_groups = assign_groups_sequential(sub_special["高さ"], cap=float(SPECIAL_HINBAN_HEIGHT_CAP))
+            sub_special["ローカルグループ番号"] = [g + base_group for g in special_groups]
+            parts.append(sub_special)
+            base_group += max(special_groups)
+        if not sub_normal.empty:
+            normal_groups = assign_groups_sequential(sub_normal["高さ"], cap=height_cap)
+            sub_normal["ローカルグループ番号"] = [g + base_group for g in normal_groups]
+            parts.append(sub_normal)
+        sub_sorted = pd.concat(parts, axis=0) if parts else sub.iloc[0:0].copy()
+        packed_list.append(sub_sorted)
+    size1_packed = pd.concat(packed_list, axis=0).reset_index(drop=True) if packed_list else size1_df.copy()
+    if _trace_on():
+        _cols = [c for c in ("NONYUHIBIN", "納入先", "納入先コード", "UKEIRE", "入車時間",
+                             "_role_class", "ローカルグループ番号", "ストア", "移動工数", "高さ",
+                             "_has_special_hinban") if c in size1_packed.columns]
+        logger.debug(
+            "TRACE#135 ローカル山の中身（積んだ順）\n%s",
+            size1_packed[_cols].sort_values(
+                by=["NONYUHIBIN", "_role_class", "ローカルグループ番号", "移動工数"],
+                ascending=[True, True, True, False],
+            ).to_string(index=False),
+        )
+        _mix = {"パレット数": ("高さ", "size"),
+                "納入先数": ("納入先", "nunique"),
+                "納入先一覧": ("納入先", _join_uniq),
+                "ローカル山数": ("ローカルグループ番号", "nunique"),
+                "Max移動工数": ("移動工数", "max"),
+                "Min移動工数": ("移動工数", "min")}
+        if "入車時間" in size1_packed.columns:
+            _mix["入車一覧"] = ("入車時間", _join_uniq)
+        logger.debug(
+            "TRACE#135 プール内の混在（納入先数>=2 なら プール跨ぎが発生している）\n%s",
+            size1_packed.groupby(["NONYUHIBIN", "_role_class"], sort=True)
+                        .agg(**_mix).reset_index().to_string(index=False),
+        )
+
+    group_table = _build_size1_stack_units(size1_packed, mixing_key)
+    # Issue #96/#170: マスタから床・締切を計算してユニットへ付与（混載判定の予防チェック用）。
+    # bin_time_map は変数化し、後段の _rescue_split_conflict_vendor（同じ関数内のクロージャ）
+    # からも参照する。これにより救済分割の床計算を bin_time_rules に一本化できる。
+    bin_time_map = build_bin_time_map(master_df)
+    group_table = attach_unit_time_bounds(group_table, bin_time_map)
+    group_cols = _size1_local_group_cols(size1_packed) + ["ローカルグループ番号"]
+
+    if _trace_on():
+        _uc = [c for c in ("山ID", "NONYUHIBIN", "納入先", "納入先コード", "入車時間", "_role_class",
+                           "ローカルグループ番号", "高さ合計", "Max移動工数",
+                           "_has_size1", "_has_size21", "_has_special_hinban", "_床秒", "_締切秒")
+               if c in group_table.columns]
+        logger.debug(
+            "TRACE#135 混載判定の入力ユニット（高さ合計 降順＝処理順）\n%s",
+            group_table[_uc].sort_values("高さ合計", ascending=False).to_string(index=False),
+        )
+    # 要件 R4〜R6: 列 → エリア → 全体の6段階でまとめる（従来ロジックは旧マッチング）
+    match_fn = _match_units_with_layer_rules if _legacy else _match_units_staged
+    id_map = match_fn(group_table, float(height_cap))
+
+    def repr_id(x: int) -> int:
+        while x in id_map:
+            x = id_map[x]
+        return x
+
+    group_table["代表山ID"] = group_table["山ID"].apply(repr_id)
+    rep_map = {old: i + 1 for i, old in enumerate(sorted(group_table["代表山ID"].unique()))}
+    group_table["山通番"] = group_table["代表山ID"].map(rep_map).astype(int)
+
+    _time_cols = [c for c in ("_床秒", "_締切秒") if c in group_table.columns]
+    size1_with_mountain = size1_packed.merge(
+        group_table[group_cols + ["山通番"] + _time_cols],
+        on=group_cols, how="left"
+    )
+    # 要件 R10: 1つのトラックだけの山を、パレット1枚単位で組み直して山を減らす（従来ロジックは対象外）
+    if not _legacy and REFILL_YAMAS_ENABLED:
+        size1_with_mountain = _refill_yamas_per_truck(size1_with_mountain, float(height_cap))
+
+
+    def _rescue_split_conflict_vendor(df_with_mountain: pd.DataFrame) -> pd.DataFrame:
+        if df_with_mountain.empty:
+            return df_with_mountain
+        if "山通番" not in df_with_mountain.columns:
+            return df_with_mountain
+        if "入車時間" not in df_with_mountain.columns:
+            return df_with_mountain
+
+        out = df_with_mountain.copy()
+        out["納入先"] = out.get("納入先", "").astype(str).map(_normalize_dest_name)
+
+        # Issue #170: 床・締切は bin_time_rules.unit_floor_deadline に一本化する。
+        # 従来の自前実装（前便 = 便番号-1、補正なし）は、同一入車時間（=同一トラック）の
+        # 便を前便と誤認して不要な床を立ててしまうため撤去する。
+        # bin_time_map はこの関数の外側（_build_size1_mixed）で定義済みの変数を
+        # クロージャとして参照する（引数追加は不要）。
+        floors, deadlines = [], []
+        for _, rr in out.iterrows():
+            floor_secs, deadline_secs = unit_floor_deadline(
+                rr.get("納入先", ""), rr.get("NONYUHIBIN", ""),
+                rr.get("入車時間", ""), bin_time_map,
+                ukeire=rr.get("UKEIRE", ""),
+            )
+            floors.append(int(floor_secs))
+            deadlines.append(deadline_secs)
+        out["_rescue_床秒"] = floors
+        out["_rescue_締切秒"] = deadlines
+
+        next_yama = int(pd.to_numeric(out["山通番"], errors="coerce").fillna(0).max()) + 1
+        for yama in sorted(pd.to_numeric(out["山通番"], errors="coerce").fillna(0).astype(int).unique()):
+            sub_idx = out.index[pd.to_numeric(out["山通番"], errors="coerce").fillna(0).astype(int) == int(yama)]
+            if len(sub_idx) <= 1:
+                continue
+            sub = out.loc[sub_idx]
+
+            deadlines_in_yama = sub["_rescue_締切秒"].dropna()
+            min_deadline = int(deadlines_in_yama.min()) if not deadlines_in_yama.empty else None
+            max_floor = int(sub["_rescue_床秒"].max())
+
+            if not _needs_mixed_deadline_rescue(sub, max_floor, min_deadline):
+                continue
+
+            # 山内で最も締切が厳しい納入先を単独山へ分離して救済する。
+            vendor_deadline: Dict[str, int] = {}
+            for _, rr in sub.iterrows():
+                vendor = str(rr.get("納入先", "")).strip()
+                d = rr.get("_rescue_締切秒")
+                if not vendor or pd.isna(d):
+                    continue
+                d = int(d)
+                if vendor not in vendor_deadline or d < vendor_deadline[vendor]:
+                    vendor_deadline[vendor] = d
+
+            if not vendor_deadline:
+                continue
+
+            target_vendor = sorted(vendor_deadline.items(), key=lambda x: (x[1], x[0]))[0][0]
+            split_mask = sub["納入先"].astype(str) == str(target_vendor)
+            if not split_mask.any() or split_mask.all():
+                continue
+
+            split_idx = sub.loc[split_mask].index
+            out.loc[split_idx, "山通番"] = int(next_yama)
+            next_yama += 1
+
+        return out.drop(columns=["_rescue_床秒", "_rescue_締切秒"], errors="ignore")
+
+    _before_rescue = size1_with_mountain["山通番"].copy() if _trace_on() else None
+    size1_with_mountain = _rescue_split_conflict_vendor(size1_with_mountain)
+    if _trace_on():
+        if _before_rescue is not None:
+            logger.debug(
+                "TRACE#135 救済分割 _rescue_split_conflict_vendor: 変更行数=%d",
+                int((_before_rescue.values != size1_with_mountain["山通番"].values).sum()),
+            )
+        _fa = {"パレット数": ("山通番", "count"),
+               "Max移動工数": ("移動工数", "max"),
+               "Min移動工数": ("移動工数", "min"),
+               "高さ合計": ("高さ", "sum"),
+               "納入先一覧": ("納入先", _join_uniq),
+               "便一覧": ("NONYUHIBIN", _join_uniq)}
+        if "入車時間" in size1_with_mountain.columns:
+            _fa["入車一覧"] = ("入車時間", _join_uniq)
+        if "ストア" in size1_with_mountain.columns:
+            _fa["ストア一覧"] = ("ストア", _join_uniq)
+        _fin = size1_with_mountain.groupby("山通番").agg(**_fa).reset_index()
+        _fin["工数レンジ"] = (_fin["Max移動工数"] - _fin["Min移動工数"]).round(4)
+        logger.debug("TRACE#135 確定した山（サイズ1/21・山通番は採番前）\n%s",
+                     _fin.to_string(index=False))
+    size1_with_mountain = size1_with_mountain.drop(
+        columns=["_is_size1", "_is_size21", "_role_class", "_床秒", "_締切秒"],
+        errors="ignore",
+    )
+
+    size1_mixed_summary = size1_with_mountain.groupby("山通番").agg(
+        パレット数=("山通番", "count"),
+        Max移動工数=("移動工数", "max")
+    ).reset_index()
+    size1_mixed_summary["引取工数"] = np.round(
+        size1_mixed_summary["Max移動工数"] + BASE_ONE_TIME +
+        ((size1_mixed_summary["パレット数"] - 1) * MIDDLE_WORK) +
+        (size1_mixed_summary["パレット数"] * BASE_PER_PAL), 0
+    ).astype(int)
+
+    if mixing_key in size1_with_mountain.columns:
+        mix_list_map = {yama: "/".join(sorted(set(vals)))
+                        for yama, vals in size1_with_mountain.groupby("山通番")[mixing_key]}
+        size1_mixed_summary["混載キー一覧"] = size1_mixed_summary["山通番"].map(mix_list_map)
+        size1_mixed_summary["混載キー種類数"] = size1_mixed_summary["混載キー一覧"].apply(
+            lambda s: len(s.split("/")) if isinstance(s, str) and s else 0)
+        size1_mixed_summary["混載フラグ"] = size1_mixed_summary["混載キー種類数"].ge(2)
+    else:
+        size1_mixed_summary["混載キー一覧"] = ""
+        size1_mixed_summary["混載キー種類数"] = 0
+        size1_mixed_summary["混載フラグ"] = False
+
+    stack_order = size1_with_mountain["サイズ種類"].astype(str).str.strip().eq("21").astype(int)
+    size1_mixed_details = (
+        size1_with_mountain.assign(_stack_order=stack_order)
+        .sort_values(by=["山通番", "_stack_order", "移動工数"], ascending=[True, True, False])
+        .drop(columns=["_stack_order"])
+    )
+    # 要件 R7（安全弁）: 従来ロジック（main と同じ組み方）でも組み、山が増えるなら従来の結果を使う
+    if not _legacy:
+        legacy_summary, legacy_details = _build_size1_mixed(
+            expanded, height_cap, mixing_key, master_df=master_df, _legacy=True
+        )
+        new_count = int(size1_mixed_details["山通番"].nunique())
+        legacy_count = int(legacy_details["山通番"].nunique())
+        extra = new_count - legacy_count  # 新しいまとめ方が何山多いか
+        if extra > R7_YAMA_TOLERANCE:
+            logger.info(
+                "[R7] 山組みの安全弁: 新しいまとめ方の山数(%d)が従来(%d)より%d山多い"
+                "（許容%d山）ため、従来の結果を使います",
+                new_count, legacy_count, extra, R7_YAMA_TOLERANCE,
+            )
+            return legacy_summary, legacy_details
+        if extra > 0:
+            logger.info(
+                "[R7] 山組みの安全弁: 新しいまとめ方の山数(%d)が従来(%d)より%d山多いが、"
+                "許容%d山以内のため、新しいまとめ方を使います",
+                new_count, legacy_count, extra, R7_YAMA_TOLERANCE,
+            )
+    return size1_mixed_summary, size1_mixed_details
+
+
+def _merge_adjacent_size17_mountains(all_df: pd.DataFrame) -> pd.DataFrame:
+    if all_df is None or all_df.empty:
+        return all_df
+    needed = {"山通番", "NONYUHIBIN", "サイズ種類", "高さ", "入車時間"}
+    if not needed.issubset(set(all_df.columns)):
+        return all_df
+
+    work = all_df.copy()
+    work["山通番"] = pd.to_numeric(work["山通番"], errors="coerce").fillna(0).astype(int)
+    work["_nony"] = work["NONYUHIBIN"].astype(str).str.strip().str.translate(_ZEN2HAN_DIGIT_COLON)
+    work["_stype"] = work["サイズ種類"].astype(str).str.strip()
+    work["_arrival"] = work["入車時間"].astype(str).str.strip()
+    work["高さ"] = pd.to_numeric(work["高さ"], errors="coerce").fillna(0.0)
+
+    stats = {}
+    for yama, sub in work.groupby("山通番", sort=True):
+        nony_set = {str(v).strip() for v in sub["_nony"].tolist() if str(v).strip()}
+        arrival_set = {str(v).strip() for v in sub["_arrival"].tolist() if str(v).strip()}
+        stype_set = {str(v).strip() for v in sub["_stype"].tolist() if str(v).strip()}
+        stats[int(yama)] = {
+            "height": float(sub["高さ"].sum()),
+            "nony": (next(iter(nony_set)) if len(nony_set) == 1 else ""),
+            "arrival": (next(iter(arrival_set)) if len(arrival_set) == 1 else ""),
+            "stype": (next(iter(stype_set)) if len(stype_set) == 1 else ""),
+            # 便(NONYUHIBIN)の単一性は要求しない。_add_truck_key_column() の設計原則
+            # （入車時間が同じなら物理的に同一トラック。ドラックヤードは1つしかない）に揃える。
+            # サイズ17は複数出荷先が共通で引き取るため、便が複数でも入車時間が単一なら対象とする。
+            "eligible": (
+                len(stype_set) == 1
+                and next(iter(stype_set), "") == SIZE17_TYPE
+                and len(arrival_set) == 1
+            ),
+        }
+
+    merge_map = {}
+    yamas = sorted(stats.keys())
+    i = 0
+    while i < len(yamas) - 1:
+        cur = int(yamas[i])
+        nxt = int(yamas[i + 1])
+        cs = stats[cur]
+        ns = stats[nxt]
+        can_merge = (
+            cs["eligible"]
+            and ns["eligible"]
+            and cs["arrival"]
+            and cs["arrival"] == ns["arrival"]
+            and (cs["height"] + ns["height"]) <= float(SIZE17_MERGE_HEIGHT_CAP)
+        )
+        if can_merge:
+            merge_map[nxt] = cur
+            cs["height"] += ns["height"]
+            stats[cur] = cs
+        i += 1
+
+    if not merge_map:
+        return all_df
+
+    logger.debug(
+        "DEBUG サイズ17隣接山統合: merge_map=%s cap=%.1f",
+        merge_map,
+        float(SIZE17_MERGE_HEIGHT_CAP),
+    )
+    work["山通番"] = work["山通番"].map(lambda y: int(merge_map.get(int(y), int(y))))
+    new_order = sorted(work["山通番"].unique().tolist())
+    renum_map = {int(old): i + 1 for i, old in enumerate(new_order)}
+    work["山通番"] = work["山通番"].map(renum_map).astype(int)
+
+    return work.drop(columns=["_nony", "_stype", "_arrival"], errors="ignore")
+
+
+# ===== 全サイズの山を統合 =====
+def build_all_mountain_details(group_details: dict, size1_mixed_details: pd.DataFrame) -> pd.DataFrame:
+    frames = []
+    max_id = 0
+
+    if size1_mixed_details is not None and not size1_mixed_details.empty and ("山通番" in size1_mixed_details.columns):
+        df1 = size1_mixed_details.copy()
+        df1["山通番"] = pd.to_numeric(df1["山通番"], errors="coerce").fillna(0).astype(int)
+        max_id = int(df1["山通番"].max()) if not df1["山通番"].empty else 0
+        frames.append(df1)
+
+    next_id = max_id + 1
+
+    def _num(v):
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    if group_details:
+        for stype, det in group_details.items():
+            stype_str = str(stype)
+            if stype_str in ("1", "21"):
+                continue
+            if det is None or det.empty:
+                continue
+            det2 = det.copy()
+            for c in ("グループ番号", "グルーピング番号", "NONYUHIBIN", "移動工数", "高さ", "納入先",
+                       "サイズ種類", "ストア", "SYUKKASAKI", "UKEIRE"):
+                if c not in det2.columns:
+                    if c in ("納入先", "サイズ種類", "ストア", "SYUKKASAKI", "UKEIRE", "NONYUHIBIN"):
+                        det2[c] = ""
+                    elif c in ("移動工数", "高さ"):
+                        det2[c] = np.nan
+                    else:
+                        det2[c] = ""
+            det2["移動工数"] = pd.to_numeric(det2["移動工数"], errors="coerce")
+            det2["高さ"] = pd.to_numeric(det2["高さ"], errors="coerce").fillna(0.0)
+
+            if stype_str == "4":
+                has_arrival_s4 = "入車時間" in det2.columns and det2["入車時間"].ne("").any()
+                if has_arrival_s4:
+                    det2 = det2.sort_values(by=["入車時間", "NONYUHIBIN", "移動工数"], ascending=[True, True, False])
+                    group_key_s4 = "入車時間"
+                else:
+                    det2["NONYUHIBIN"] = det2["NONYUHIBIN"].astype(str).str.strip()
+                    det2 = det2.sort_values(by=["NONYUHIBIN", "移動工数"], ascending=[True, False])
+                    group_key_s4 = "NONYUHIBIN"
+                rows = []
+                cap = DEFAULT_HEIGHT_CAP
+                for key_val, grp in det2.groupby(group_key_s4, sort=False):
+                    current_h = 0.0
+                    current_yama_id = next_id
+                    for _, r in grp.iterrows():
+                        h = _num(r.get("高さ", 0.0))
+                        if current_h + h > cap and current_h > 0:
+                            next_id += 1
+                            current_yama_id = next_id
+                            current_h = 0.0
+                        current_h += h
+                        rr = r.copy()
+                        rr["山通番"] = current_yama_id
+                        rows.append(rr)
+                    next_id += 1
+                if rows:
+                    frames.append(pd.DataFrame(rows))
+            else:
+                col_g = ("グループ番号" if "グループ番号" in det2.columns
+                         else ("グルーピング番号" if "グルーピング番号" in det2.columns else None))
+                if col_g is None:
+                    continue
+                det2[col_g] = pd.to_numeric(det2[col_g], errors="coerce").fillna(0).astype(int)
+                det2 = det2.sort_values(by=["移動工数", "納入先"], ascending=[False, True])
+                rows = []
+                for gno, sub in det2.groupby(col_g, sort=True):
+                    sub2 = sub.copy()
+                    sub2["山通番"] = next_id
+                    next_id += 1
+                    rows.append(sub2)
+                if rows:
+                    frames.append(pd.concat(rows, axis=0, ignore_index=True))
+
+    if not frames:
+        return pd.DataFrame()
+    all_df = pd.concat(frames, axis=0, ignore_index=True)
+    for c in ("納入先", "山通番", "移動工数", "高さ", "サイズ種類", "UKEIRE", "ストア", "NONYUHIBIN", "SYUKKASAKI", "ローカルグループ番号"):
+        if c not in all_df.columns:
+            if c in ("納入先", "サイズ種類", "UKEIRE", "ストア", "NONYUHIBIN", "SYUKKASAKI"):
+                all_df[c] = ""
+            elif c in ("移動工数", "高さ"):
+                all_df[c] = np.nan
+            else:
+                all_df[c] = ""
+    all_df["納入先"] = all_df["納入先"].astype(str).str.strip()
+    all_df["サイズ種類"] = all_df["サイズ種類"].astype(str).str.strip()
+    all_df["NONYUHIBIN"] = all_df["NONYUHIBIN"].astype(str).str.strip().str.translate(_ZEN2HAN_DIGIT_COLON)
+    all_df = _merge_adjacent_size17_mountains(all_df)
+    if "山通番" in all_df.columns and not all_df.empty:
+        work = all_df.copy()
+        work["山通番"] = pd.to_numeric(work["山通番"], errors="coerce").fillna(0).astype(int)
+        work["NONYUHIBIN"] = work["NONYUHIBIN"].astype(str).str.strip().str.translate(_ZEN2HAN_DIGIT_COLON)
+
+        def _order_tail_key(s: str) -> int:
+            t = str(s).strip()
+            if len(t) >= 2 and t[-2:].isdigit():
+                return int(t[-2:])
+            return 99
+
+        def _size_key(s: str) -> tuple:
+            t = str(s).strip()
+            if t.isdigit():
+                return (0, int(t), t)
+            return (1, 999, t)
+
+        yama_keys = {}
+        for yama, sub in work.groupby("山通番", sort=False):
+            tails = [_order_tail_key(v) for v in sub["NONYUHIBIN"].tolist()]
+            sizes = [_size_key(v) for v in sub["サイズ種類"].tolist()]
+            order_key = min(tails) if tails else 99
+            size_order_key = min(sizes) if sizes else (1, 999, "")
+            yama_keys[int(yama)] = (order_key, size_order_key, int(yama))
+
+        old_yamas_sorted = sorted(yama_keys.keys(), key=lambda y: yama_keys[y])
+        renum_map = {int(old): i + 1 for i, old in enumerate(old_yamas_sorted)}
+        all_df["山通番"] = all_df["山通番"].map(renum_map).astype(int)
+
+    if {"山通番", "移動工数", "サイズ種類"}.issubset(all_df.columns):
+        all_df["移動工数"] = pd.to_numeric(all_df["移動工数"], errors="coerce")
+        stack_order = all_df["サイズ種類"].astype(str).str.strip().eq("21").astype(int)
+        all_df = (
+            all_df.assign(_stack_order=stack_order)
+            .sort_values(["山通番", "_stack_order", "移動工数"], ascending=[True, True, False])
+            .drop(columns=["_stack_order"])
+            .reset_index(drop=True)
+        )
+    return all_df
+
+
+# ===== バッテリー交換の仮想山（特別部品） =====
+def create_battery_change_mountain() -> pd.DataFrame:
+    """【特別な関数】バッテリー交換の仮想山を1行作成する。
+    
+    ★ 重要：この関数は process_assigner を通さず、最初から「完成品」の仮想山を返す。
+    
+    設計の根拠：
+    - バッテリー交換は「固定10分＝600秒」の作業時間を持つ
+    - この値が「移動工数」から計算されるべきではなく、最初から指定される
+    - scheduler.insert_virtual_mountain_into_lane() は virtual_row から
+      「引取工数_秒」を直接読むため、こちらで完成品を用意する必要がある
+    - 後ろの process_assigner では計算されないので、工数が消えてしまう危険がない
+    
+    列の説明：
+    - 山通番=-1        : 仮想山の識別子（既存山は1,2,3...なので負数で区別）
+    - 引取工数_秒=600  : スケジューラで使用する作業時間（秒単位）
+    - 締め切り_秒=None : 「その日のうちに必ず処理」（後回しにしない）ため締切なし
+    - 開始時間_秒=0    : 開始時間の下限なし
+    - 納入先='〔バッテリー交換〕': UI表示用の識別子
+    - その他の列       : build_all_mountain_details() の出力と同じ列構成を持つため
+                        NaN/空文字で埋める（pd.concat 時に列のズレを防ぐ）
+    
+    Parameters
+    ----------
+    （なし）
+    
+    Returns
+    -------
+    pd.DataFrame
+        1行の仮想山。build_all_mountain_details() の出力と同じ列構成。
+    """
+    # ★ スケジューラで使う必須列
+    battery_row = {
+        '山通番': -1,                       # 仮想山の識別子
+        '引取工数_秒': 600,                 # 10分＝600秒（process_assigner 計算済み）
+        '締め切り_秒': None,                # 後回しにしない仕様
+        '開始時間_秒': 0,                   # 開始下限なし
+        
+        # ★ build_all_mountain_details() の保証列（既存山と統合するため）
+        '移動工数': 0,                      # ダミー（process_assigner 非適用）
+        '高さ': 0,                         # ダミー
+        '納入先': '〔バッテリー交換〕',     # UI表示用
+        'NONYUHIBIN': '',                 # 表示用オプション
+        'UKEIRE': '',                     # 表示用オプション
+        'ストア': '',                      # 表示用オプション
+        'SYUKKASAKI': '',                 # 表示用オプション
+        'サイズ種類': '',                  # 表示用オプション
+        'ローカルグループ番号': 0,         # グループ識別子（仮想山なので0）
+    }
+    
+    # 辞書を1行の DataFrame に変換
+    return pd.DataFrame([battery_row])
+
+
+# ===== 集計ユーティリティ =====
+def get_dest_list_for_group(det_g: pd.DataFrame) -> list:
+    if "納入先" in det_g.columns and det_g["納入先"].notna().any():
+        col = "納入先"
+    elif "納入先コード" in det_g.columns and det_g["納入先コード"].notna().any():
+        col = "納入先コード"
+    elif "SYUKKASAKI" in det_g.columns and det_g["SYUKKASAKI"].notna().any():
+        col = "SYUKKASAKI"
+    else:
+        return []
+    return sorted(set(map(str, det_g[col].tolist())))
+
+
+def compute_basic_groups(group_details: dict, group_results: dict, height_cap: int) -> pd.DataFrame:
+    rows = []
+    if not group_details or not group_results:
+        return pd.DataFrame(columns=["サイズ種類", "グループ番号", "パレット数", "Max移動工数", "引取工数", "高さ合計", "納入先一覧", "混載"])
+    for stype, det in group_details.items():
+        res = group_results.get(stype)
+        if det is None or det.empty or res is None or res.empty:
+            continue
+        for _, g in res.iterrows():
+            gno = g["グループ番号"]
+            det_g = det.loc[det["グループ番号"] == gno]
+            hsum = float(det_g["高さ"].astype(float).sum()) if "高さ" in det_g.columns else 0.0
+            dests = get_dest_list_for_group(det_g)
+            rows.append({
+                "サイズ種類": str(stype), "グループ番号": int(gno),
+                "パレット数": int(g["パレット数"]), "Max移動工数": float(g["Max移動工数"]),
+                "引取工数": int(g["引取工数"]), "高さ合計": int(round(hsum)),
+                "納入先一覧": "/".join(dests), "混載": "★" if len(dests) >= 2 else ""
+            })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["サイズ種類", "グループ番号", "パレット数", "Max移動工数", "引取工数", "高さ合計", "納入先一覧", "混載"])
+    return df.sort_values(by=["サイズ種類", "グループ番号"]).reset_index(drop=True)
+
+
+def compute_mixed_groups(size1_mixed_summary, size1_mixed_details, height_cap: int) -> pd.DataFrame:
+    if size1_mixed_summary is None or size1_mixed_details is None or size1_mixed_summary.empty or size1_mixed_details.empty:
+        return pd.DataFrame(columns=["山通番", "パレット数", "Max移動工数", "引取工数", "total工数", "高さ合計", "混載キー種類数", "混載フラグ", "混載キー一覧"])
+    hsum_map = (size1_mixed_details.assign(_h=size1_mixed_details["高さ"].astype(float))
+                .groupby("山通番")["_h"].sum().to_dict())
+    rows = []
+    for _, s in size1_mixed_summary.sort_values("山通番").iterrows():
+        yama = int(s["山通番"])
+        hsum = float(hsum_map.get(yama, 0.0))
+        max_cost = float(s["Max移動工数"])
+        pick_cost = float(s["引取工数"])
+        total_cost = max_cost + pick_cost
+        rows.append({
+            "山通番": yama, "パレット数": int(s["パレット数"]),
+            "Max移動工数": max_cost, "引取工数": int(pick_cost),
+            "total工数": round(total_cost, 3), "高さ合計": int(round(hsum)),
+            "混載キー種類数": int(s.get("混載キー種類数", 0)),
+            "混載フラグ": bool(s.get("混載フラグ", False)),
+            "混載キー一覧": s.get("混載キー一覧", "")
+        })
+    return pd.DataFrame(rows)
+
+
+def compute_dest_by_mountain(size1_mixed_details, size1_mixed_summary, height_cap: int) -> pd.DataFrame:
+    if size1_mixed_summary is None or size1_mixed_details is None or size1_mixed_summary.empty or size1_mixed_details.empty:
+        return pd.DataFrame(columns=["山通番", "納入先数", "納入先一覧", "パレット数", "高さ合計"])
+    hsum_map = (size1_mixed_details.assign(_h=size1_mixed_details["高さ"].astype(float))
+                .groupby("山通番")["_h"].sum().to_dict())
+    dest_map = (size1_mixed_details.groupby("山通番")["納入先"]
+                .apply(lambda s: sorted(set(map(str, s)))).to_dict())
+    rows = []
+    for _, s in size1_mixed_summary.iterrows():
+        yama = int(s["山通番"])
+        dests = dest_map.get(yama, [])
+        hsum = float(hsum_map.get(yama, 0.0))
+        rows.append({
+            "山通番": yama, "納入先数": len(dests),
+            "納入先一覧": "/".join(dests), "パレット数": int(s["パレット数"]),
+            "高さ合計": int(round(hsum)),
+        })
+    return pd.DataFrame(rows).sort_values("山通番").reset_index(drop=True)

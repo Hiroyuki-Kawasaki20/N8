@@ -1,0 +1,31 @@
+{
+  "base_dir": "C:\\Users\\YOUR_NUMBER\\YOUR_COMPANY\\YOUR_DEPARTMENT\\SharedFolder - 発注情報",
+  "export_dir": "C:\\Users\\YOUR_NUMBER\\YOUR_COMPANY\\YOUR_DEPARTMENT\\SharedFolder - テスト",
+  "height_cap": 2450,
+  "worker_speed_sec_per_unit": 3.0,
+  "work_start_time": "08:00",
+  "break_times": [
+    [
+      "08:30",
+      "08:41"
+    ],
+    [
+      "10:20",
+      "10:31"
+    ],
+    [
+      "12:00",
+      "13:01"
+    ],
+    [
+      "14:50",
+      "15:01"
+    ]
+  ],
+  "auto_reload_minute": 30,
+  "enable_battery_change": true,
+  "archive_enabled": true,
+  "archive_dir": "",
+  "export_invariant_strict": false,
+  "export_invariant_audit_cost": false
+}
