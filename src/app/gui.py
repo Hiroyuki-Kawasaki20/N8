@@ -77,7 +77,7 @@ from src.services.export_validator import verify_export_invariant
 from src.services.export_archive import archive_export, resolve_archive_dir
 from src.utils.normalizer import _normalize_dest_name, _ZEN2HAN_DIGIT_COLON
 
-APP_VERSION = "2026-11-04 起動時stderr警告処理とbat運用案内を修正"
+APP_VERSION = "2026-11-12 N8用の設定・保存先と起動環境を分離"
 # ===== CustomTkinter 設定 =====
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
@@ -152,7 +152,7 @@ def _special_hinban_first(df: pd.DataFrame) -> pd.DataFrame:
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("CHかんばんセット — 仕分け・セットボード")
+        self.title("N8かんばんセット — 仕分け・セットボード")
         self._version_label = APP_VERSION
         _sw = self.winfo_screenwidth()
         _sh = self.winfo_screenheight()
@@ -1205,7 +1205,7 @@ class App(ctk.CTk):
             return
         self.progress_bar.pack(fill="x", pady=(0, 4))
         self.progress_bar.start()
-        self.title("実行中... CHかんばんセット")
+        self.title("実行中... N8かんばんセット")
         self.update_idletasks()
         try:
             # 便名を内部名に変換（KVC-B7 -> KVC など）
@@ -1233,7 +1233,7 @@ class App(ctk.CTk):
         except Exception as e:
             self.progress_bar.stop()
             self.progress_bar.pack_forget()
-            self.title("CHかんばんセット — 仕分け・セットボード")
+            self.title("N8かんばんセット — 仕分け・セットボード")
             messagebox.showerror("実行エラー", str(e))
             return
         self.filtered = filtered
@@ -1248,7 +1248,7 @@ class App(ctk.CTk):
             # エラー時は履歴を push しない（変更なし）
             self.progress_bar.stop()
             self.progress_bar.pack_forget()
-            self.title("CHかんばんセット — 仕分け・セットボード")
+            self.title("N8かんばんセット — 仕分け・セットボード")
             return
 
         # ⑤ 実行成功時に確定した終了時刻を履歴に push（計算後のみ）
@@ -1284,7 +1284,7 @@ class App(ctk.CTk):
 
         self.progress_bar.stop()
         self.progress_bar.pack_forget()
-        self.title("CHかんばんセット — 仕分け・セットボード")
+        self.title("N8かんばんセット — 仕分け・セットボード")
         self.notebook.set("セットボード")
         self._on_main_tab_changed()
         self._update_status()

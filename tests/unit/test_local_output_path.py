@@ -62,7 +62,7 @@ def _run_child(tmp_path, code, *, localappdata="local", trace=False):
     else:
         env["LOCALAPPDATA"] = str(tmp_path / localappdata) if localappdata else ""
     base = Path(env["LOCALAPPDATA"]) if env.get("LOCALAPPDATA") else home / "AppData" / "Local"
-    env["CH_TEST_EXPECTED"] = str(base / "CHKanban" / "output")
+    env["CH_TEST_EXPECTED"] = str(base / "N8Kanban" / "output")
     result = subprocess.run(
         [sys.executable, "-B", "-c", _CHILD_SETUP + textwrap.dedent(code)],
         cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", timeout=60,
@@ -86,7 +86,7 @@ def test_localappdata_is_user_specific(tmp_path):
 def test_missing_localappdata_uses_current_home(tmp_path, localappdata):
     _run_child(tmp_path, """
         from src.models.constants import LOCAL_OUTPUT_DIR
-        assert Path(LOCAL_OUTPUT_DIR) == Path.home() / 'AppData' / 'Local' / 'CHKanban' / 'output'
+        assert Path(LOCAL_OUTPUT_DIR) == Path.home() / 'AppData' / 'Local' / 'N8Kanban' / 'output'
         assert Path(LOCAL_OUTPUT_DIR) == expected, LOCAL_OUTPUT_DIR
     """, localappdata=localappdata)
 
