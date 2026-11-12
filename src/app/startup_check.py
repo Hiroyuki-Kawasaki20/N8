@@ -18,7 +18,7 @@ def main() -> None:
     if Path(sys.executable).resolve() != Path(args.expected_python).resolve():
         raise SystemExit("Unexpected Python interpreter; refusing to start.")
     if sys.version_info[:2] != (3, 11):
-        raise SystemExit("Python 3.11 is required; prepare your DIG_new environment.")
+        raise SystemExit("Python 3.11 is required; prepare your N8_new environment.")
     for name in ("tkinter", "pandas", "numpy", "openpyxl", "customtkinter"):
         module = importlib.import_module(name)
         print(f"Library: {name} {getattr(module, '__version__', 'available')}")

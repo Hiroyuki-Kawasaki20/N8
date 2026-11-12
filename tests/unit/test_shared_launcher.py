@@ -16,14 +16,14 @@ pytestmark = pytest.mark.skipif(os.name != 'nt', reason='Windows bat integration
 def launcher(tmp_path):
     shared = tmp_path / '共有 app'
     shared.mkdir()
-    shutil.copy2(REPO_ROOT / 'run_ch_kanban.bat', shared / 'run_ch_kanban.bat')
+    shutil.copy2(REPO_ROOT / 'run_n8_kanban.bat', shared / 'run_n8_kanban.bat')
     script = REPO_ROOT / 'scripts' / 'start_ch_kanban.ps1'
     if script.exists():
         (shared / 'scripts').mkdir()
         shutil.copy2(script, shared / 'scripts' / script.name)
     home = tmp_path / 'user home'
     home.mkdir()
-    prefix = home / '.conda' / 'envs' / 'DIG_new'
+    prefix = home / '.conda' / 'envs' / 'N8_new'
     prefix.mkdir(parents=True)
     (prefix / 'python.exe').touch()  # fake condaはこのファイルを実行しない
     (prefix / 'conda-meta').mkdir()
@@ -40,12 +40,13 @@ def launcher(tmp_path):
         'if not errorlevel 1 set "EXIT_TO_USE=%CH_TEST_GUI_EXIT%"\n'
         'exit /b %EXIT_TO_USE%\n', encoding='ascii')
     env = os.environ.copy()
+    env.pop('CH_KANBAN_ENV_PREFIX', None)
     env.update({
         'USERPROFILE': str(home), 'HOME': str(home), 'LOCALAPPDATA': str(home / 'AppData' / 'Local'),
         'TEMP': str(tmp_path), 'TMP': str(tmp_path), 'ProgramData': str(tmp_path / 'shared-conda'),
         'ProgramFiles': str(tmp_path / 'program-files'), 'ProgramFiles(x86)': str(tmp_path / 'program-files-x86'),
         'PATH': str(Path(os.environ['SystemRoot']) / 'System32'),
-        'CONDA_EXE': str(conda), 'CH_KANBAN_ENV_PREFIX': str(prefix),
+        'CONDA_EXE': str(conda), 'N8_KANBAN_ENV_PREFIX': str(prefix),
         'CH_TEST_CALLS': str(tmp_path / 'calls.txt'), 'CH_TEST_CWD': str(tmp_path / 'cwd.txt'),
         'CH_TEST_EXIT': '0', 'CH_TEST_GUI_EXIT': '0',
     })
@@ -54,7 +55,7 @@ def launcher(tmp_path):
 
 def _launch(launcher, *, self_test=True):
     shared, env = launcher
-    command = f'""{shared / "run_ch_kanban.bat"}"' + (' --self-test' if self_test else '') + '"'
+    command = f'""{shared / "run_n8_kanban.bat"}"' + (' --self-test' if self_test else '') + '"'
     result = subprocess.run(
         f'"{os.environ["COMSPEC"]}" /d /s /c {command}', cwd=shared.parent, env=env,
         input=b'\n', capture_output=True, timeout=30,
@@ -69,24 +70,42 @@ def _calls(env):
 
 def test_bat_requires_explicit_personal_environment(launcher):
     _, env = launcher
-    env.pop('CH_KANBAN_ENV_PREFIX')
+    env.pop('N8_KANBAN_ENV_PREFIX')
+    ch_prefix = Path(env['USERPROFILE']) / '.conda' / 'envs' / 'DIG_new'
+    ch_prefix.mkdir(parents=True)
+    (ch_prefix / 'python.exe').touch()
+    (ch_prefix / 'conda-meta').mkdir()
+    env['CH_KANBAN_ENV_PREFIX'] = str(ch_prefix)
     result = _launch(launcher)
     assert result.returncode != 0
-    assert b'CH_KANBAN_ENV_PREFIX' in result.stdout + result.stderr
+    assert b'N8_KANBAN_ENV_PREFIX' in result.stdout + result.stderr
     assert not _calls(env)
+
+
+@pytest.mark.parametrize('shared_conda', [False, True])
+def test_bat_auto_detects_personal_or_shared_conda(launcher, shared_conda):
+    _, env = launcher
+    conda = Path(env.pop('CONDA_EXE'))
+    if shared_conda:
+        shared = Path(env['ProgramData']) / 'anaconda3' / 'condabin' / 'conda.bat'
+        shared.parent.mkdir(parents=True)
+        shutil.move(conda, shared)
+    result = _launch(launcher)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert env['N8_KANBAN_ENV_PREFIX'].encode('ascii') in _calls(env)
 
 
 @pytest.mark.parametrize('invalid', ['missing', 'other-user', 'base'])
 def test_bat_rejects_missing_foreign_or_base_environment(launcher, invalid):
     shared, env = launcher
-    prefix = Path(env['CH_KANBAN_ENV_PREFIX'])
+    prefix = Path(env['N8_KANBAN_ENV_PREFIX'])
     if invalid == 'missing':
         (prefix / 'python.exe').unlink()
     else:
-        wrong = shared.parent / 'other-user' / 'DIG_new' if invalid == 'other-user' else Path(env['USERPROFILE']) / 'base'
+        wrong = shared.parent / 'other-user' / 'N8_new' if invalid == 'other-user' else Path(env['USERPROFILE']) / 'base'
         wrong.mkdir(parents=True)
         (wrong / 'python.exe').touch(); (wrong / 'conda-meta').mkdir()
-        env['CH_KANBAN_ENV_PREFIX'] = str(wrong)
+        env['N8_KANBAN_ENV_PREFIX'] = str(wrong)
     assert _launch(launcher).returncode != 0
     assert not _calls(env)
 
@@ -123,9 +142,9 @@ def test_bat_uses_prefix_and_self_test_without_gui(launcher, shared_conda):
     assert result.returncode == 0, result.stdout + result.stderr
     calls = _calls(env)
     assert b'run -p ' in calls and b'run -n ' not in calls
-    assert env['CH_KANBAN_ENV_PREFIX'].encode('ascii') in calls
+    assert env['N8_KANBAN_ENV_PREFIX'].encode('ascii') in calls
     assert b'src.app.startup_check' in calls and b'src.app.gui' not in calls
-    log_dir = Path(env['LOCALAPPDATA']) / 'CHKanban' / 'output' / 'logs'
+    log_dir = Path(env['LOCALAPPDATA']) / 'N8Kanban' / 'output' / 'logs'
     logs = list(log_dir.glob('startup_*.log'))
     assert logs
     text = logs[0].read_text(encoding='utf-8-sig')
@@ -158,7 +177,7 @@ def test_bat_logs_stdout_without_stderr_and_succeeds(launcher, self_test):
     result = _launch(launcher, self_test=self_test)
     assert result.returncode == 0, result.stdout + result.stderr
 
-    log_dir = Path(env['LOCALAPPDATA']) / 'CHKanban' / 'output' / 'logs'
+    log_dir = Path(env['LOCALAPPDATA']) / 'N8Kanban' / 'output' / 'logs'
     logs = list(log_dir.glob('startup_*.log'))
     assert len(logs) == 1
     text = logs[0].read_text(encoding='utf-8-sig')
@@ -174,7 +193,7 @@ def test_bat_logs_stdout_and_stderr_warning_without_failing(launcher, self_test)
     result = _launch(launcher, self_test=self_test)
     assert result.returncode == 0, result.stdout + result.stderr
 
-    log_dir = Path(env['LOCALAPPDATA']) / 'CHKanban' / 'output' / 'logs'
+    log_dir = Path(env['LOCALAPPDATA']) / 'N8Kanban' / 'output' / 'logs'
     logs = list(log_dir.glob('startup_*.log'))
     assert len(logs) == 1
     text = logs[0].read_text(encoding='utf-8-sig')
@@ -193,7 +212,7 @@ def test_bat_reports_nonzero_exit_after_logging_both_streams(launcher, self_test
     result = _launch(launcher, self_test=self_test)
     assert result.returncode != 0
 
-    log_dir = Path(env['LOCALAPPDATA']) / 'CHKanban' / 'output' / 'logs'
+    log_dir = Path(env['LOCALAPPDATA']) / 'N8Kanban' / 'output' / 'logs'
     logs = list(log_dir.glob('startup_*.log'))
     assert len(logs) == 1
     text = logs[0].read_text(encoding='utf-8-sig')
@@ -247,5 +266,5 @@ def test_bat_logging_falls_back_to_own_home(launcher, localappdata):
     else:
         env['LOCALAPPDATA'] = localappdata
     assert _launch(launcher).returncode == 0
-    logs = Path(env['USERPROFILE']) / 'AppData' / 'Local' / 'CHKanban' / 'output' / 'logs'
+    logs = Path(env['USERPROFILE']) / 'AppData' / 'Local' / 'N8Kanban' / 'output' / 'logs'
     assert list(logs.glob('startup_*.log'))

@@ -5,22 +5,22 @@ Claude Code がこのリポジトリで作業するときの前提・規約を�
 
 ## プロジェクト概要
 
-CHラインのかんばんを仕分け、**3レーン構成**の工程へ割り振るデスクトップGUIアプリ（Python + customtkinter）。
+CHの安定版を起点とするN8受入向け開発中のデスクトップGUIアプリ（Python + customtkinter）。N8の3工程＋リリーフは未実装で、業務投入不可・exe使用配布不可。
 出荷情報CSV・出荷場一覧CSV・入車時間マスタを読み込み、仕分け結果の表示とSPOアップロード用Excelの出力を行う。
 
-- 業務ルールの**正本**: [docs/仕分け・割り振りルール.md](docs/仕分け・割り振りルール.md)
+- コピー元CHの業務ルール（N8仕様は未確定）: [docs/仕分け・割り振りルール.md](docs/仕分け・割り振りルール.md)
 - 要件 / 構成: [docs/requirements.md](docs/requirements.md) / [docs/architecture.md](docs/architecture.md)
 - 利用者向け操作手順: [docs/利用マニュアル.md](docs/利用マニュアル.md)
 
 ## 開発環境とコマンド
 
-Python **3.11**（3.11.14 で動作確認）／conda環境名は **`DIG_new`** 固定（`run_ch_kanban.bat` が前提にしている）。
+Python **3.11**／N8のconda環境名は **`N8_new`**（`run_n8_kanban.bat` が前提にしている）。
 
 ```powershell  
 # 環境の有効化  
-conda activate DIG_new  
+conda activate N8_new
   
-# アプリ起動（通常は run_ch_kanban.bat をダブルクリック）  
+# 開発時のアプリ起動（本番データは使用しない）
 python -m src.app.gui  
   
 # テスト  

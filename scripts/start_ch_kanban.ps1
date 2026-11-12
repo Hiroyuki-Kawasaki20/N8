@@ -58,7 +58,7 @@ function Invoke-CondaPython([string[]]$PythonArgs) {
         $ErrorActionPreference = $previousErrorActionPreference
     }
     if ($processResult.ExitCode -ne 0) {
-        throw "conda / DIG_new Python failed (exit $($processResult.ExitCode)). See the startup log."
+        throw "conda / N8_new Python failed (exit $($processResult.ExitCode)). See the startup log."
     }
 }
 
@@ -66,23 +66,23 @@ try {
     if (-not $env:USERPROFILE) { throw 'USERPROFILE is missing. Sign in with your Windows account.' }
     $local = $env:LOCALAPPDATA
     if (-not $local) { $local = Join-Path $env:USERPROFILE 'AppData\Local' }
-    $logDir = Join-Path $local 'CHKanban\output\logs'
+    $logDir = Join-Path $local 'N8Kanban\output\logs'
     [IO.Directory]::CreateDirectory($logDir) | Out-Null
     $logFile = Join-Path $logDir ('startup_' + [guid]::NewGuid().ToString('N') + '.log')
     "Started: $(Get-Date -Format o)" | Set-Content -LiteralPath $logFile -Encoding UTF8
     Write-Host "Log: $logFile"
 
     # A name alone is ambiguous with shared conda installs. Never guess or fall back to base.
-    if (-not [IO.Path]::IsPathRooted($env:CH_KANBAN_ENV_PREFIX)) {
-        throw 'CH_KANBAN_ENV_PREFIX must be an absolute path to your DIG_new folder.'
+    if (-not [IO.Path]::IsPathRooted($env:N8_KANBAN_ENV_PREFIX)) {
+        throw 'N8_KANBAN_ENV_PREFIX must be an absolute path to your N8_new folder.'
     }
-    $prefix = [IO.Path]::GetFullPath($env:CH_KANBAN_ENV_PREFIX)
-    if (-not (Test-UnderRoot $prefix $env:USERPROFILE) -or (Split-Path $prefix -Leaf) -ine 'DIG_new') {
-        throw 'CH_KANBAN_ENV_PREFIX must be an absolute DIG_new folder under your own USERPROFILE (not base or another user).'
+    $prefix = [IO.Path]::GetFullPath($env:N8_KANBAN_ENV_PREFIX)
+    if (-not (Test-UnderRoot $prefix $env:USERPROFILE) -or (Split-Path $prefix -Leaf) -ine 'N8_new') {
+        throw 'N8_KANBAN_ENV_PREFIX must be an absolute N8_new folder under your own USERPROFILE (not base or another user).'
     }
     $python = Join-Path $prefix 'python.exe'
     if (-not (Test-Path -LiteralPath $python -PathType Leaf) -or -not (Test-Path -LiteralPath (Join-Path $prefix 'conda-meta') -PathType Container)) {
-        throw 'Your DIG_new environment or python.exe was not found. Prepare it using the approved setup procedure.'
+        throw 'Your N8_new environment or python.exe was not found. Prepare it using the approved setup procedure.'
     }
     $conda = Find-Conda
     $appDir = Split-Path -Parent $PSScriptRoot
@@ -93,7 +93,7 @@ try {
     Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
     $env:CONDA_REPORT_ERRORS = 'false'
     $env:CONDA_OFFLINE = 'true'
-    Write-StartupLog "Conda: $conda`nDIG_new: $prefix`nApp: $appDir"
+    Write-StartupLog "Conda: $conda`nN8_new: $prefix`nApp: $appDir"
     Invoke-CondaPython @('-B', '-m', 'src.app.startup_check', '--expected-python', $python)
     if (-not $SelfTest) {
         Invoke-CondaPython @('-B', '-m', 'src.app.gui')

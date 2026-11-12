@@ -120,7 +120,7 @@ def export_setboard_html(
 <head>
     <meta charset=\"utf-8\" />
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-    <title>CHかんばんセットボード</title>
+    <title>N8かんばんセットボード</title>
     <style>
         body {{ font-family: "Meiryo UI", "Yu Gothic UI", sans-serif; margin: 0; background: #f3f4f6; color: #1f2937; }}
         header {{ background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #fff; padding: 14px 18px; }}
@@ -147,7 +147,7 @@ def export_setboard_html(
 </head>
 <body>
     <header>
-        <h1>CHかんばんセットボード（HTML出力）</h1>
+        <h1>N8かんばんセットボード（HTML出力）</h1>
         <div class=\"meta\">出力日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
     </header>
     <main>

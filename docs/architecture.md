@@ -117,13 +117,13 @@ SPO用Excel自動出力
   - 出荷場一覧CSV
   - 入車時間マスタExcel
 - 設定ファイル:
-  - `%LOCALAPPDATA%\CHKanban\ch_kanban_settings.json`（利用者別。`LOCALAPPDATA` 未設定時は本人ホームの `AppData\Local`）
+  - `%LOCALAPPDATA%\N8Kanban\ch_kanban_settings.json`（利用者別。`LOCALAPPDATA` 未設定時は本人ホームの `AppData\Local`）
   - 主なキー: `base_dir`, `export_dir`, `auto_reload_minute`
 - 終了時刻履歴:
-  - `%LOCALAPPDATA%\CHKanban\lane_end_times_history.json`（利用者別。`LOCALAPPDATA` 未設定時は本人ホームの `AppData\Local`）
+  - `%LOCALAPPDATA%\N8Kanban\lane_end_times_history.json`（利用者別。`LOCALAPPDATA` 未設定時は本人ホームの `AppData\Local`）
 - ローカル成果物・ログ:
-  - `%LOCALAPPDATA%\CHKanban\output` 配下（未ヒットCSV、履歴Excel、アプリログ、bat起動ログなど）
-  - `LOCALAPPDATA` 未設定時は本人ホームの `AppData\Local\CHKanban\output`
+  - `%LOCALAPPDATA%\N8Kanban\output` 配下（未ヒットCSV、履歴Excel、アプリログ、bat起動ログなど）
+  - `LOCALAPPDATA` 未設定時は本人ホームの `AppData\Local\N8Kanban\output`
 - SPO本体Excel:
   - 設定された `export_dir`（利用者が指定するSPO監視フォルダ）
 
@@ -141,11 +141,11 @@ SPO用Excel自動出力
 | 出力物 | 通常保存先 |
 |---|---|
 | `SPOアップロード用.xlsx`（主出力） | 利用者が指定した `export_dir` |
-| `SPOアップロード用_未ヒット一覧.csv`（未ヒットがある場合） | `%LOCALAPPDATA%\CHKanban\output` |
-| `SPOアップロード用_履歴.xlsx` | `%LOCALAPPDATA%\CHKanban\output` |
-| アプリログ・bat起動ログ | `%LOCALAPPDATA%\CHKanban\output\logs` |
+| `SPOアップロード用_未ヒット一覧.csv`（未ヒットがある場合） | `%LOCALAPPDATA%\N8Kanban\output` |
+| `SPOアップロード用_履歴.xlsx` | `%LOCALAPPDATA%\N8Kanban\output` |
+| アプリログ・bat起動ログ | `%LOCALAPPDATA%\N8Kanban\output\logs` |
 
-`LOCALAPPDATA` が未設定の場合は、これらのローカル保存先を本人ホームの `AppData\Local\CHKanban` 以下に置き換えます。Excelのローカル保存完了はOneDriveからSPOへの同期完了を意味しません。
+`LOCALAPPDATA` が未設定の場合は、これらのローカル保存先を本人ホームの `AppData\Local\N8Kanban` 以下に置き換えます。Excelのローカル保存完了はOneDriveからSPOへの同期完了を意味しません。
 
 - 補助出力（ユーティリティとして実装済み）:
   - セットボードHTML

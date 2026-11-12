@@ -15,6 +15,6 @@
 
 ## Current status
 
-This is a copy of CH logic only. N8-specific settings separation, process assignment, and input reconciliation are not implemented. The three-process-plus-relief workflow is also not implemented.
+CH logic remains in place. N8-specific settings and startup are separated; process assignment and input reconciliation are not implemented. The three-process-plus-relief workflow is also not implemented.
 
-Do not launch the normal GUI yet. It may access CH settings or shared master files because N8-specific storage and workflow isolation have not been implemented.
+Do not use the application for N8 operations. Development tests must use dedicated test input and output folders, not CH or production data.
